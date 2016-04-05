@@ -1,4 +1,22 @@
 #!/usr/bin/python
+"""
+Paraproxio is an HTTP proxy with a parallel downloading of big files.
+"""
+# Copyright (C) 2016 Alexander Logger <intagger@gmail.com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
 
 __version__ = '1.0'
 
@@ -42,11 +60,11 @@ DEFAULT_CHUNK_DOWNLOAD_TIMEOUT = 10
 DEFAULT_CHUNK_SIZE = 64 * 1024
 DEFAULT_PARALLELS = 10
 
-DEFAULT_WORKING_DIR = '.paraprox'
+DEFAULT_WORKING_DIR = '.paraproxio'
 DEFAULT_BUFFER_DIR = os.path.join(DEFAULT_WORKING_DIR, 'buffer')
 DEFAULT_LOGS_DIR = os.path.join(DEFAULT_WORKING_DIR, 'logs')
-DEFAULT_SERVER_LOG_FILENAME = 'paraprox.server.log'
-DEFAULT_ACCESS_LOG_FILENAME = 'paraprox.access.log'
+DEFAULT_SERVER_LOG_FILENAME = 'paraproxio.server.log'
+DEFAULT_ACCESS_LOG_FILENAME = 'paraproxio.access.log'
 
 NOT_STARTED = 'NOT STARTED'
 DOWNLOADING = 'DOWNLOADING'
@@ -55,8 +73,8 @@ CANCELLED = 'CANCELLED'
 
 _DOWNLOADER_STATES = {NOT_STARTED, DOWNLOADING, DOWNLOADED, CANCELLED}
 
-server_logger = logging.getLogger('paraprox.server')
-access_logger = logging.getLogger('paraprox.access')
+server_logger = logging.getLogger('paraproxio.server')
+access_logger = logging.getLogger('paraproxio.access')
 
 files_to_parallel = ['.iso', '.zip', '.rpm', '.gz']
 
@@ -457,15 +475,15 @@ class HttpRequestHandler(aiohttp.server.ServerHttpProtocol):
         return '%s:%s' % (address, port)
 
 
-class ParaproxError(Exception):
+class ParaproxioError(Exception):
     pass
 
 
-class PartDownloadError(ParaproxError):
+class PartDownloadError(ParaproxioError):
     pass
 
 
-class UnsupportedError(ParaproxError):
+class UnsupportedError(ParaproxioError):
     pass
 
 
@@ -498,7 +516,7 @@ def setup_logging(logs_dir: str, server_log_filename: str, access_log_filename: 
 
 
 def get_args():
-    parser = argparse.ArgumentParser(prog="paraprox",
+    parser = argparse.ArgumentParser(prog="paraproxio",
                                      description="An HTTP proxy with a parallel downloading of big files.")
     parser.add_argument("-H", "--host", type=str, default=DEFAULT_HOST, help="host address")
     parser.add_argument("-P", "--port", type=int, default=DEFAULT_PORT, help="port")
@@ -507,7 +525,7 @@ def get_args():
     parser.add_argument("--buffer-dir", type=str, default=DEFAULT_BUFFER_DIR, help="buffer dir")
     parser.add_argument("--logs-dir", type=str, default=DEFAULT_LOGS_DIR, help="logs dir")
     parser.add_argument("--debug", action="store_true", help="enable debug information in the stdout")
-    parser.add_argument("--version", action="version", version="Paraprox/" + __version__)
+    parser.add_argument("--version", action="version", version="Paraproxio/" + __version__)
     return parser.parse_args()
 
 
@@ -532,7 +550,7 @@ def run():
     f = loop.create_server(create_http_request_handler, args.host, args.port)
 
     srv = loop.run_until_complete(f)
-    print('Paraprox serving on', srv.sockets[0].getsockname())
+    print('Paraproxio serving on', srv.sockets[0].getsockname())
     try:
         loop.run_forever()
     except KeyboardInterrupt:
