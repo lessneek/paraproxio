@@ -34,6 +34,7 @@ import logging
 import os
 import shutil
 import argparse
+import concurrent.futures
 
 from asyncio import AbstractEventLoop, Future
 from asyncio.futures import CancelledError
@@ -132,7 +133,8 @@ class RangeDownloader:
             *,
             loop: AbstractEventLoop = None,
             chunk_size=DEFAULT_CHUNK_SIZE,
-            chunk_download_timeout=DEFAULT_CHUNK_DOWNLOAD_TIMEOUT):
+            chunk_download_timeout=DEFAULT_CHUNK_DOWNLOAD_TIMEOUT,
+            executor=None):
         self._path = path
         self._bytes_range = bytes_range
         self.buffer_file_path = buffer_file_path
@@ -143,6 +145,7 @@ class RangeDownloader:
         self._headers = {'Range': 'bytes={0[0]!s}-{0[1]!s}'.format(self._bytes_range)}
         self._bytes_downloaded = 0
         self._state = NOT_STARTED
+        self._executor = executor
 
     @property
     def state(self) -> str:
@@ -201,7 +204,7 @@ class RangeDownloader:
         await self._run_nonblocking(flush_and_release)
 
     async def _run_nonblocking(self, func):
-        await self._loop.run_in_executor(None, lambda: func())
+        await self._loop.run_in_executor(self._executor, lambda: func())
 
     def _create_buffer_file(self):
         f = open(self.buffer_file_path, 'xb')
@@ -237,7 +240,7 @@ class ParallelDownloader:
         self._downloaders = []  # type: List[RangeDownloader]
         self._downloads = []  # type: List[Future]
         self._state = NOT_STARTED
-
+        self._executor = None
         self._create_download_dir()
 
     @property
@@ -255,12 +258,20 @@ class ParallelDownloader:
         # Calculate bytes ranges.
         bytes_ranges = get_bytes_ranges(self._file_length, self._parallels)
 
+        # Create custom executor.
+        self._executor = concurrent.futures.ThreadPoolExecutor(self._parallels)
+
         # Create a downloader for each bytes range.
         for i, bytes_range in enumerate(bytes_ranges):
             filename = '{idx:02}_{range[0]!s}-{range[1]!s}.tmp'.format(idx=i, range=bytes_range)
             buffer_file_path = os.path.join(self._download_dir, filename)
-            self._downloaders.append(RangeDownloader(
-                self._path, bytes_range, buffer_file_path, loop=self._loop, chunk_size=self._chunk_size))
+            self._downloaders.append(
+                RangeDownloader(self._path,
+                                bytes_range,
+                                buffer_file_path,
+                                loop=self._loop,
+                                chunk_size=self._chunk_size,
+                                executor=self._executor))
 
         # Start downloaders.
         for downloader in self._downloaders:
