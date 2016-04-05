@@ -59,7 +59,8 @@ DEFAULT_PORT = 8880
 
 DEFAULT_CHUNK_DOWNLOAD_TIMEOUT = 10
 DEFAULT_CHUNK_SIZE = 64 * 1024
-DEFAULT_PARALLELS = 10
+DEFAULT_PARALLELS = 32
+DEFAULT_MAX_WORKERS = 8
 
 DEFAULT_WORKING_DIR = '.paraproxio'
 DEFAULT_BUFFER_DIR = os.path.join(DEFAULT_WORKING_DIR, 'buffer')
@@ -133,8 +134,7 @@ class RangeDownloader:
             *,
             loop: AbstractEventLoop = None,
             chunk_size=DEFAULT_CHUNK_SIZE,
-            chunk_download_timeout=DEFAULT_CHUNK_DOWNLOAD_TIMEOUT,
-            executor=None):
+            chunk_download_timeout=DEFAULT_CHUNK_DOWNLOAD_TIMEOUT):
         self._path = path
         self._bytes_range = bytes_range
         self.buffer_file_path = buffer_file_path
@@ -145,7 +145,6 @@ class RangeDownloader:
         self._headers = {'Range': 'bytes={0[0]!s}-{0[1]!s}'.format(self._bytes_range)}
         self._bytes_downloaded = 0
         self._state = NOT_STARTED
-        self._executor = executor
 
     @property
     def state(self) -> str:
@@ -204,7 +203,7 @@ class RangeDownloader:
         await self._run_nonblocking(flush_and_release)
 
     async def _run_nonblocking(self, func):
-        await self._loop.run_in_executor(self._executor, lambda: func())
+        await self._loop.run_in_executor(None, lambda: func())
 
     def _create_buffer_file(self):
         f = open(self.buffer_file_path, 'xb')
@@ -240,7 +239,6 @@ class ParallelDownloader:
         self._downloaders = []  # type: List[RangeDownloader]
         self._downloads = []  # type: List[Future]
         self._state = NOT_STARTED
-        self._executor = None
         self._create_download_dir()
 
     @property
@@ -258,9 +256,6 @@ class ParallelDownloader:
         # Calculate bytes ranges.
         bytes_ranges = get_bytes_ranges(self._file_length, self._parallels)
 
-        # Create custom executor.
-        self._executor = concurrent.futures.ThreadPoolExecutor(self._parallels)
-
         # Create a downloader for each bytes range.
         for i, bytes_range in enumerate(bytes_ranges):
             filename = '{idx:02}_{range[0]!s}-{range[1]!s}.tmp'.format(idx=i, range=bytes_range)
@@ -270,8 +265,7 @@ class ParallelDownloader:
                                 bytes_range,
                                 buffer_file_path,
                                 loop=self._loop,
-                                chunk_size=self._chunk_size,
-                                executor=self._executor))
+                                chunk_size=self._chunk_size))
 
         # Start downloaders.
         for downloader in self._downloaders:
@@ -532,6 +526,7 @@ def get_args():
     parser.add_argument("-H", "--host", type=str, default=DEFAULT_HOST, help="host address")
     parser.add_argument("-P", "--port", type=int, default=DEFAULT_PORT, help="port")
     parser.add_argument("--parallels", type=int, default=DEFAULT_PARALLELS, help="parallel downloads of a big file")
+    parser.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS, help="max workers of executor")
     parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE, help="chunk size")
     parser.add_argument("--buffer-dir", type=str, default=DEFAULT_BUFFER_DIR, help="buffer dir")
     parser.add_argument("--logs-dir", type=str, default=DEFAULT_LOGS_DIR, help="logs dir")
@@ -546,7 +541,12 @@ def run():
     setup_dirs(args.buffer_dir, args.logs_dir)
     setup_logging(args.logs_dir, DEFAULT_SERVER_LOG_FILENAME, DEFAULT_ACCESS_LOG_FILENAME)
 
+    # Create custom executor.
+    executor = concurrent.futures.ThreadPoolExecutor(args.max_workers)
+
+    # Create an event loop.
     loop = asyncio.get_event_loop()
+    loop.set_default_executor(executor)
 
     def create_http_request_handler():
         return HttpRequestHandler(
