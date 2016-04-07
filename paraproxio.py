@@ -71,7 +71,7 @@ DEFAULT_ACCESS_LOG_FILENAME = 'paraproxio.access.log'
 
 DEFAULT_PARACCESS_LOG_FORMAT = '%a %l %u %t "%r" %s %b "%{Referrer}i" "%{User-Agent}i" %{Parallels}o'
 
-PARALLELS_HEADER = 'Parallels'  # Used in responses. Value: number of parallel downloads used.
+PARALLELS_HEADER = 'X-Parallels'  # Used in responses. Value: number of parallel downloads used.
 
 server_logger = logging.getLogger('paraproxio.server')
 access_logger = logging.getLogger('paraproxio.access')
