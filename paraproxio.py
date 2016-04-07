@@ -19,6 +19,7 @@ Paraproxio is an HTTP proxy with a parallel downloading of big files.
 
 
 __version__ = '1.0'
+PARAPROXIO_VERSION = "Paraproxio/" + __version__
 
 import sys
 
@@ -39,7 +40,7 @@ import concurrent.futures
 from asyncio import AbstractEventLoop, Future
 from asyncio.futures import CancelledError
 from typing import Tuple, Callable, Optional, List
-from urllib.parse import urlparse
+from urllib.parse import urlparse, ParseResult
 
 try:
     import aiohttp
@@ -68,15 +69,19 @@ DEFAULT_LOGS_DIR = os.path.join(DEFAULT_WORKING_DIR, 'logs')
 DEFAULT_SERVER_LOG_FILENAME = 'paraproxio.server.log'
 DEFAULT_ACCESS_LOG_FILENAME = 'paraproxio.access.log'
 
+DEFAULT_PARACCESS_LOG_FORMAT = '%a %l %u %t "%r" %s %b "%{Referrer}i" "%{User-Agent}i" %{Parallels}o'
+
+PARALLELS_HEADER = 'Parallels'  # Used in responses. Value: number of parallel downloads used.
+
+server_logger = logging.getLogger('paraproxio.server')
+access_logger = logging.getLogger('paraproxio.access')
+
 NOT_STARTED = 'NOT STARTED'
 DOWNLOADING = 'DOWNLOADING'
 DOWNLOADED = 'DOWNLOADED'
 CANCELLED = 'CANCELLED'
 
 _DOWNLOADER_STATES = {NOT_STARTED, DOWNLOADING, DOWNLOADED, CANCELLED}
-
-server_logger = logging.getLogger('paraproxio.server')
-access_logger = logging.getLogger('paraproxio.access')
 
 files_to_parallel = ['.iso', '.zip', '.rpm', '.gz']
 
@@ -214,7 +219,7 @@ class RangeDownloader:
         self._buffer_file = f
 
     def __repr__(self, *args, **kwargs):
-        return '<RangeDownloader: [{0[0]!s}-{0[1]!s}] {!r}>'.format(self._bytes_range, self._path)
+        return '<RangeDownloader: [{0[0]!s}-{0[1]!s}] {1!r}>'.format(self._bytes_range, self._path)
 
 
 class ParallelDownloader:
@@ -327,15 +332,15 @@ class ParallelDownloader:
         return '<ParallelDownloader: {!r}>'.format(self._path)
 
 
-class HttpRequestHandler(aiohttp.server.ServerHttpProtocol):
+class ParallelHttpRequestHandler(aiohttp.server.ServerHttpProtocol):
     def __init__(
             self, *, loop: AbstractEventLoop = None,
             keep_alive=75,
             keep_alive_on=True,
             timeout=0,
-            logger=server_logger,
-            access_log=access_logger,
-            access_log_format=aiohttp.helpers.AccessLogger.LOG_FORMAT,
+            server_logger=server_logger,
+            access_logger=access_logger,
+            access_log_format=DEFAULT_PARACCESS_LOG_FORMAT,
             debug=False,
             log=None,
             parallels: int = DEFAULT_PARALLELS,
@@ -346,8 +351,8 @@ class HttpRequestHandler(aiohttp.server.ServerHttpProtocol):
             keep_alive=keep_alive,
             keep_alive_on=keep_alive_on,
             timeout=timeout,
-            logger=logger,
-            access_log=access_log,
+            logger=server_logger,
+            access_log=access_logger,
             access_log_format=access_log_format,
             debug=debug,
             log=log,
@@ -436,7 +441,6 @@ class HttpRequestHandler(aiohttp.server.ServerHttpProtocol):
             return None
 
         # All checks pass, start a parallel downloading.
-        # TODO: log as access, not as debug.
         self.log_debug("PARALLEL GET {!r} [{!s} bytes]".format(message.path, content_length))
 
         # Get additional file info.
@@ -447,6 +451,7 @@ class HttpRequestHandler(aiohttp.server.ServerHttpProtocol):
         client_res.add_header(hdrs.CONTENT_LENGTH, str(content_length))
         if content_type:
             client_res.add_header(hdrs.CONTENT_TYPE, content_type)
+        client_res.add_header(PARALLELS_HEADER, str(self._parallels))
         client_res.send_headers()
 
         pd = ParallelDownloader(message.path, content_length,
@@ -480,6 +485,75 @@ class HttpRequestHandler(aiohttp.server.ServerHttpProtocol):
         return '%s:%s' % (address, port)
 
 
+class ParallelHttpRequestHandlerFactory:
+    def __init__(self, *,
+                 handler_class=ParallelHttpRequestHandler,
+                 loop=None,
+                 server_logger=server_logger,
+                 access_logger=access_logger,
+                 **kwargs):
+        self._handler_class = handler_class
+        self._loop = loop
+        self._server_logger = server_logger
+        self._access_logger = access_logger
+        self._connections = {}
+        self._kwargs = kwargs
+        self.num_connections = 0
+
+    @property
+    def connections(self):
+        return list(self._connections.keys())
+
+    def connection_made(self, handler, transport):
+        self._connections[handler] = transport
+
+    def connection_lost(self, handler, exc=None):
+        if handler in self._connections:
+            del self._connections[handler]
+
+    async def _connections_cleanup(self):
+        sleep = 0.05
+        while self._connections:
+            await asyncio.sleep(sleep, loop=self._loop)
+            if sleep < 5:
+                sleep *= 2
+
+    async def finish_connections(self, timeout=None):
+        # try to close connections in 90% of graceful timeout
+        timeout90 = None
+        if timeout:
+            timeout90 = timeout / 100 * 90
+
+        for handler in self._connections.keys():
+            handler.closing(timeout=timeout90)
+
+        if timeout:
+            try:
+                await asyncio.wait_for(
+                    self._connections_cleanup(), timeout, loop=self._loop)
+            except asyncio.TimeoutError:
+                self._server_logger.warning(
+                    "Not all connections are closed (pending: %d)",
+                    len(self._connections))
+
+        for transport in self._connections.values():
+            transport.close()
+
+        self._connections.clear()
+
+    def __call__(self):
+        self.num_connections += 1
+        try:
+            return self._handler_class(
+                loop=self._loop,
+                server_logger=server_logger,
+                access_logger=access_logger,
+                **self._kwargs)
+        except:
+            server_logger.exception(
+                'Can not create request handler: {!r}'.format(self._handler_class))
+
+
 class ParaproxioError(Exception):
     pass
 
@@ -497,26 +571,31 @@ def setup_dirs(*dirs):
         os.makedirs(d, exist_ok=True)
 
 
-def setup_logging(logs_dir: str, server_log_filename: str, access_log_filename: str):
-    server_logger.setLevel(logging.DEBUG)
-    access_logger.setLevel(logging.DEBUG)
+def setup_logging(
+        logs_dir: str,
+        server_log_filename: str,
+        access_log_filename: str,
+        *,
+        debug=False):
+    # Set levels.
+    level = logging.DEBUG if debug else logging.INFO
+    server_logger.setLevel(level)
+    access_logger.setLevel(level)
 
     # stderr handler.
     ch = logging.StreamHandler(sys.stderr)
-    ch.setLevel(logging.DEBUG)
+    ch.setLevel(level)
     server_logger.addHandler(ch)
     access_logger.addHandler(ch)
 
     # Server log file handler.
-    slfp = os.path.join(logs_dir, server_log_filename)
-    slfh = logging.FileHandler(slfp)
-    slfh.setLevel(logging.DEBUG)
+    slfh = logging.FileHandler(os.path.join(logs_dir, server_log_filename))
+    slfh.setLevel(level)
     server_logger.addHandler(slfh)
 
     # Access log file handler.
-    alfp = os.path.join(logs_dir, access_log_filename)
-    alfh = logging.FileHandler(alfp)
-    alfh.setLevel(logging.DEBUG)
+    alfh = logging.FileHandler(os.path.join(logs_dir, access_log_filename))
+    alfh.setLevel(level)
     access_logger.addHandler(alfh)
 
 
@@ -530,8 +609,8 @@ def get_args():
     parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE, help="chunk size")
     parser.add_argument("--buffer-dir", type=str, default=DEFAULT_BUFFER_DIR, help="buffer dir")
     parser.add_argument("--logs-dir", type=str, default=DEFAULT_LOGS_DIR, help="logs dir")
-    parser.add_argument("--debug", action="store_true", help="enable debug information in the stdout")
-    parser.add_argument("--version", action="version", version="Paraproxio/" + __version__)
+    parser.add_argument("--debug", default=False, action="store_true", help="enable debug information in the stdout")
+    parser.add_argument("--version", action="version", version=PARAPROXIO_VERSION)
     return parser.parse_args()
 
 
@@ -539,7 +618,10 @@ def run():
     args = get_args()
 
     setup_dirs(args.buffer_dir, args.logs_dir)
-    setup_logging(args.logs_dir, DEFAULT_SERVER_LOG_FILENAME, DEFAULT_ACCESS_LOG_FILENAME)
+    setup_logging(args.logs_dir,
+                  DEFAULT_SERVER_LOG_FILENAME,
+                  DEFAULT_ACCESS_LOG_FILENAME,
+                  debug=args.debug)
 
     # Create custom executor.
     executor = concurrent.futures.ThreadPoolExecutor(args.max_workers)
@@ -548,24 +630,24 @@ def run():
     loop = asyncio.get_event_loop()
     loop.set_default_executor(executor)
 
-    def create_http_request_handler():
-        return HttpRequestHandler(
-            loop=loop,
-            logger=server_logger,
-            access_log=access_logger,
-            debug=args.debug,
-            parallels=args.parallels,
-            chunk_size=args.chunk_size,
-            keep_alive=75)
+    handler_factory = ParallelHttpRequestHandlerFactory(loop=loop, debug=args.debug,
+                                                        parallels=args.parallels,
+                                                        chunk_size=args.chunk_size,
+                                                        keep_alive=75)
 
-    f = loop.create_server(create_http_request_handler, args.host, args.port)
-
-    srv = loop.run_until_complete(f)
+    srv = loop.run_until_complete(loop.create_server(handler_factory, args.host, args.port))
     print('Paraproxio serving on', srv.sockets[0].getsockname())
+    if args.debug:
+        print('Debug mode.')
     try:
         loop.run_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        srv.close()
+        loop.run_until_complete(srv.wait_closed())
+        loop.run_until_complete(handler_factory.finish_connections())
+    loop.close()
 
 
 if __name__ == '__main__':
