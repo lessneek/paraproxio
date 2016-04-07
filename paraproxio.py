@@ -138,15 +138,17 @@ class RangeDownloader:
             buffer_file_path,
             *,
             loop: AbstractEventLoop = None,
+            server_logger=server_logger,
             chunk_size=DEFAULT_CHUNK_SIZE,
             chunk_download_timeout=DEFAULT_CHUNK_DOWNLOAD_TIMEOUT):
         self._path = path
         self._bytes_range = bytes_range
+        self._length = bytes_range[1] - bytes_range[0] + 1
         self.buffer_file_path = buffer_file_path
         self._loop = loop if loop is not None else asyncio.get_event_loop()
+        self._server_logger = server_logger
         self._chunk_size = chunk_size
         self._chunk_download_timeout = chunk_download_timeout
-        self._buffer_file_length = bytes_range[1] - bytes_range[0] + 1
         self._headers = {'Range': 'bytes={0[0]!s}-{0[1]!s}'.format(self._bytes_range)}
         self._bytes_downloaded = 0
         self._state = NOT_STARTED
@@ -169,7 +171,10 @@ class RangeDownloader:
             # Request a host for a file part.
             async with session.request('GET', self._path) as res:  # type: aiohttp.ClientResponse
                 if res.status != 206:
-                    raise PartDownloadError('Expected status code 206, but {!s} received.', res.status)
+                    raise WrongResponseError('Expected status code 206, but {!s} ({!s}) received.',
+                                             res.status,
+                                             res.reason)
+
                 hrh = res.headers  # type: CIMultiDictProxy
                 # TODO: check headers.
 
@@ -179,17 +184,33 @@ class RangeDownloader:
                     with aiohttp.Timeout(self._chunk_download_timeout):
                         chunk = await res.content.read(self._chunk_size)
                         self._bytes_downloaded += len(chunk)
+
+                        self._debug("Read ({!s} bytes). Downloaded: {!s} of {!s} bytes. [{!s}%]".format(
+                            len(chunk), self._bytes_downloaded, self._length,
+                            (self._bytes_downloaded // self._length) * 100))
+
                         if not chunk:
                             self._state = DOWNLOADED
                             break
                         await self._write_chunk(chunk)
                 await self._flush_and_release()
-
+                session.close()
+        except WrongResponseError as exc:
+            self._debug('Wrong response error: {!r}.'.format(exc))
+            self.cancel()
+        except asyncio.TimeoutError:
+            self._debug('Timeout.')
+            self.cancel()
         except Exception as exc:
+            self._debug('Unexpected exception: {!r}.'.format(exc))
             self.cancel()
         finally:
             session.close()
             return self._state
+
+    def _debug(self, msg, *args, **kwargs):
+        msg = "{!r} {!s}".format(self, msg)
+        self._server_logger.debug(msg, *args, **kwargs)
 
     def cancel(self):
         if self._state != DOWNLOADING:
@@ -199,20 +220,22 @@ class RangeDownloader:
     async def _write_chunk(self, chunk):
         await self._run_nonblocking(lambda: self._buffer_file.write(chunk))
 
-    async def _flush_and_release(self):
+    def _flush_and_release(self):
         def flush_and_release():
+            if not self._buffer_file:
+                return
             self._buffer_file.flush()
             self._buffer_file.close()
             del self._buffer_file
 
-        await self._run_nonblocking(flush_and_release)
+        return self._run_nonblocking(flush_and_release)
 
-    async def _run_nonblocking(self, func):
-        await self._loop.run_in_executor(None, lambda: func())
+    def _run_nonblocking(self, func):
+        return self._loop.run_in_executor(None, lambda: func())
 
     def _create_buffer_file(self):
         f = open(self.buffer_file_path, 'xb')
-        f.seek(self._buffer_file_length - 1)
+        f.seek(self._length - 1)
         f.write(b'0')
         f.flush()
         f.seek(0)
@@ -558,7 +581,7 @@ class ParaproxioError(Exception):
     pass
 
 
-class PartDownloadError(ParaproxioError):
+class WrongResponseError(ParaproxioError):
     pass
 
 
