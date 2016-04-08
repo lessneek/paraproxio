@@ -672,7 +672,7 @@ def run():
     finally:
         srv.close()
         loop.run_until_complete(srv.wait_closed())
-        loop.run_until_complete(handler_factory.finish_connections())
+        loop.run_until_complete(handler_factory.finish_connections(timeout=15))
     loop.close()
 
 
