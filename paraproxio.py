@@ -185,9 +185,9 @@ class RangeDownloader:
                         chunk = await res.content.read(self._chunk_size)
                         self._bytes_downloaded += len(chunk)
 
-                        self._debug("Read ({!s} bytes). Downloaded: {!s} of {!s} bytes. [{!s}%]".format(
+                        self._debug("Read ({!s} bytes). Downloaded: {!s} of {!s} bytes. [{:.2%}]".format(
                             len(chunk), self._bytes_downloaded, self._length,
-                            (self._bytes_downloaded // self._length) * 100))
+                            self._bytes_downloaded / self._length))
 
                         if not chunk:
                             self._state = DOWNLOADED
