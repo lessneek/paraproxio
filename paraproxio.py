@@ -360,7 +360,7 @@ class ParallelDownloader:
 
 class ParallelHttpRequestHandler(aiohttp.server.ServerHttpProtocol):
     def __init__(
-            self, *, loop: AbstractEventLoop = None,
+            self, manager, *, loop: AbstractEventLoop = None,
             keep_alive=75,
             keep_alive_on=True,
             timeout=0,
@@ -384,9 +384,21 @@ class ParallelHttpRequestHandler(aiohttp.server.ServerHttpProtocol):
             log=log,
             **kwargs)
 
+        self._manager = manager
         self._loop = loop
         self._parallels = parallels
         self._chunk_size = chunk_size
+
+    def connection_made(self, transport):
+        super().connection_made(transport)
+        self._manager.connection_made(self, transport)
+
+    def connection_lost(self, exc):
+        self._manager.connection_lost(self, exc)
+        super().connection_lost(exc)
+
+    def closing(self, timeout=15.0):
+        super().closing(timeout)
 
     def check_request(self, message: RawRequestMessage):
         if message.method == hdrs.METH_CONNECT:
@@ -571,6 +583,7 @@ class ParallelHttpRequestHandlerFactory:
         self.num_connections += 1
         try:
             return self._handler_class(
+                manager=self,
                 loop=self._loop,
                 server_logger=server_logger,
                 access_logger=access_logger,
