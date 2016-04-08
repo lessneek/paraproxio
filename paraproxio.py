@@ -195,6 +195,9 @@ class RangeDownloader:
                         await self._write_chunk(chunk)
                 await self._flush_and_release()
                 session.close()
+        except aiohttp.ServerDisconnectedError as exc:
+            self._debug('Server disconnected error: {!r}.'.format(exc))
+            self.cancel()
         except WrongResponseError as exc:
             self._debug('Wrong response error: {!r}.'.format(exc))
             self.cancel()
