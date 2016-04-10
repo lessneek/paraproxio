@@ -638,7 +638,7 @@ def setup_logging(
     access_logger.addHandler(alfh)
 
 
-def get_args():
+def get_args(args):
     parser = argparse.ArgumentParser(prog="paraproxio",
                                      description="An HTTP proxy with a parallel downloading of big files.")
     parser.add_argument("-H", "--host", type=str, default=DEFAULT_HOST, help="host address")
@@ -650,11 +650,11 @@ def get_args():
     parser.add_argument("--logs-dir", type=str, default=DEFAULT_LOGS_DIR, help="logs dir")
     parser.add_argument("--debug", default=False, action="store_true", help="enable debug information in the stdout")
     parser.add_argument("--version", action="version", version=PARAPROXIO_VERSION)
-    return parser.parse_args()
+    return parser.parse_args(args)
 
 
-def run():
-    args = get_args()
+def run(args=None, loop=None):
+    args = get_args(args)
 
     setup_dirs(args.buffer_dir, args.logs_dir)
     setup_logging(args.logs_dir,
@@ -666,7 +666,8 @@ def run():
     executor = concurrent.futures.ThreadPoolExecutor(args.max_workers)
 
     # Create an event loop.
-    loop = asyncio.get_event_loop()
+    if loop is None:
+        loop = asyncio.get_event_loop()
     loop.set_default_executor(executor)
 
     handler_factory = ParallelHttpRequestHandlerFactory(loop=loop, debug=args.debug,
