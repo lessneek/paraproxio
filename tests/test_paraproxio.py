@@ -21,7 +21,6 @@ import threading
 import time
 import unittest
 from asyncio import BaseEventLoop
-from typing import Optional
 from urllib.parse import urlparse, ParseResult
 
 import aiohttp.client
@@ -59,36 +58,81 @@ class TestRequestHandler(aiohttp.server.ServerHttpProtocol):
         client_res.add_header(hdrs.CONTENT_LENGTH, str(file_len))
         client_res.send_headers()
         client_res.write(file_bytes)
-        client_res.write_eof()
+        await client_res.write_eof()
+
+
+STOPPED = 'STOPPED'
+STARTING = 'STARTING'
+STARTED = 'STARTED'
+STOPPING = 'STOPPING'
 
 
 class LoopThread:
     def __init__(self):
+        self._state = STOPPED
         self._worker_thread = None
-        self._loop = None  # type: Optional[BaseEventLoop]
+        self._state_changed = threading.Condition()
+
+    @property
+    def state(self):
+        return self._state
 
     def run(self, loop, *args, **kwargs):
         pass
 
+    def _set_started(self):
+        with self._state_changed:
+            self._state = STARTED
+            self._state_changed.notify_all()
+
     def _run(self, *args, **kwargs):
-        # Create custom executor.
-        executor = concurrent.futures.ThreadPoolExecutor()
+        try:
+            with self._state_changed:
+                if self._state != STARTING:
+                    return
 
-        # Create an event loop.
-        loop = self._loop = asyncio.new_event_loop()
-        loop.set_default_executor(executor)
+            # Create custom executor.
+            executor = concurrent.futures.ThreadPoolExecutor()
 
-        self.run(loop, *args, **kwargs)
+            # Create an event loop.
+            loop = self._loop = asyncio.new_event_loop()  # type: BaseEventLoop
+            loop.set_default_executor(executor)
+
+            # Schedule 'set started' on loop.
+            loop.call_later(1, self._set_started)
+            self.run(loop, *args, **kwargs)
+        finally:
+            with self._state_changed:
+                self._state = STOPPED
+                self._state_changed.notify_all()
 
     def start(self, *args, **kwargs):
+        with self._state_changed:
+            if self._state != STOPPED:
+                return
+            self._state = STARTING
+            self._state_changed.notify_all()
+
         self._worker_thread = threading.Thread(target=self._run, name=self.name, args=args, kwargs=kwargs)
         self._worker_thread.start()
 
+    def stopping(self):
+        pass
+
     def stop(self):
+        with self._state_changed:
+            # Wait while starting state.
+            while self._state == STARTING:
+                self._state_changed.wait()
+            if self._state == STOPPED or self._state == STOPPING:
+                return
+            self._state = STOPPING
+            self._state_changed.notify_all()
+
+        self.stopping()
+
         loop = self._loop
-        # self._loop = None
         if loop is not None:
-            # loop.stop()
             loop.call_soon_threadsafe(lambda: loop.stop())
             while loop.is_running():
                 time.sleep(1)
@@ -114,9 +158,12 @@ class TestWebServer(LoopThread):
                                     TEST_WEB_SERVER_PORT))
         self.loop.run_forever()
 
-    def stop(self):
-        self._srv.close()
-        super().stop()
+    def close_server(self):
+        if self._srv is not None:
+            self._srv.close()
+
+    def stopping(self):
+        self.loop.call_soon_threadsafe(self.close_server)
 
     @property
     def name(self):
@@ -140,15 +187,20 @@ def create_host_url(filename):
 
 
 class TestParaproxio(unittest.TestCase):
-    def test_normal_get(self):
+    def setUp(self):
         # Start a web server.
-        web_server = TestWebServer()
-        web_server.start()
+        self.web_server = TestWebServer()
+        self.web_server.start()
 
         # Start a proxy server.
-        proxy_server = TestParaproxioServer()
-        proxy_server.start(args=['--host', PROXY_SERVER_HOST, '--port', str(PROXY_SERVER_PORT)])
+        self.proxy_server = TestParaproxioServer()
+        self.proxy_server.start(args=['--host', PROXY_SERVER_HOST, '--port', str(PROXY_SERVER_PORT)])
 
+    def tearDown(self):
+        self.proxy_server.stop()
+        self.web_server.stop()
+
+    def test_normal_get(self):
         # Make a test request to the web server through the proxy.
         async def test():
             await asyncio.sleep(3)
@@ -168,9 +220,10 @@ class TestParaproxio(unittest.TestCase):
             loop.run_until_complete(asyncio.ensure_future(test()))
         except KeyboardInterrupt:
             pass
-        finally:
-            proxy_server.stop()
-            web_server.stop()
+
+    def test_parallel_get(self):
+        # TODO: implement.
+        pass
 
 
 if __name__ == "__main__":
