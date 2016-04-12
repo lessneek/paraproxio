@@ -662,13 +662,16 @@ def run(args=None, loop=None):
                   DEFAULT_ACCESS_LOG_FILENAME,
                   debug=args.debug)
 
-    # Create custom executor.
-    executor = concurrent.futures.ThreadPoolExecutor(args.max_workers)
+    autoclose_loop = False
 
     # Create an event loop.
     if loop is None:
-        loop = asyncio.get_event_loop()
-    loop.set_default_executor(executor)
+        autoclose_loop = True
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(None)
+        # Create custom executor.
+        executor = concurrent.futures.ThreadPoolExecutor(args.max_workers)
+        loop.set_default_executor(executor)
 
     handler_factory = ParallelHttpRequestHandlerFactory(loop=loop, debug=args.debug,
                                                         parallels=args.parallels,
@@ -687,7 +690,9 @@ def run(args=None, loop=None):
         srv.close()
         loop.run_until_complete(srv.wait_closed())
         loop.run_until_complete(handler_factory.finish_connections(timeout=15))
-    loop.close()
+
+    if autoclose_loop:
+        loop.close()
 
 
 if __name__ == '__main__':
