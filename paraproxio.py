@@ -165,36 +165,37 @@ class RangeDownloader:
         # Prepare an empty buffer file.
         await self._loop.run_in_executor(None, self._create_buffer_file)
 
-        # Create client session for downloading a file part from a host.
-        session = aiohttp.ClientSession(loop=self._loop, headers=self._headers)
         try:
-            # Request a host for a file part.
-            async with session.request('GET', self._path) as res:  # type: aiohttp.ClientResponse
-                if res.status != 206:
-                    raise WrongResponseError('Expected status code 206, but {!s} ({!s}) received.',
-                                             res.status,
-                                             res.reason)
+            # Create client session for downloading a file part from a host.
+            async with aiohttp.ClientSession(loop=self._loop, headers=self._headers) as session:
+                # Request a host for a file part.
+                async with session.request('GET', self._path) as res:  # type: aiohttp.ClientResponse
+                    if res.status != 206:
+                        raise WrongResponseError('Expected status code 206, but {!s} ({!s}) received.',
+                                                 res.status,
+                                                 res.reason)
 
-                hrh = res.headers  # type: CIMultiDictProxy
-                # TODO: check headers.
+                    hrh = res.headers  # type: CIMultiDictProxy
+                    # TODO: check headers.
 
-                # Read content by chunks and write to the buffer file.
-                self._state = DOWNLOADING
-                while self._state is DOWNLOADING:
-                    with aiohttp.Timeout(self._chunk_download_timeout):
-                        chunk = await res.content.read(self._chunk_size)
-                        self._bytes_downloaded += len(chunk)
+                    # Read content by chunks and write to the buffer file.
+                    self._state = DOWNLOADING
+                    while self._state is DOWNLOADING:
+                        with aiohttp.Timeout(self._chunk_download_timeout):
+                            chunk = await res.content.read(self._chunk_size)
+                            self._bytes_downloaded += len(chunk)
 
-                        self._debug("Read ({!s} bytes). Downloaded: {!s} of {!s} bytes. [{:.2%}]".format(
-                            len(chunk), self._bytes_downloaded, self._length,
-                            self._bytes_downloaded / self._length))
+                            self._debug("Read ({!s} bytes). Downloaded: {!s} of {!s} bytes. [{:.2%}]".format(
+                                len(chunk), self._bytes_downloaded, self._length,
+                                self._bytes_downloaded / self._length))
 
-                        if not chunk:
-                            self._state = DOWNLOADED
-                            break
-                        await self._write_chunk(chunk)
-                await self._flush_and_release()
-                session.close()
+                            if not chunk:
+                                self._state = DOWNLOADED
+                                break
+                            await self._write_chunk(chunk)
+                    await self._flush_and_release()
+                    if self._state != DOWNLOADED:
+                        res.close()  # Close the response if not downloaded.
         except aiohttp.ServerDisconnectedError as exc:
             self._debug('Server disconnected error: {!r}.'.format(exc))
             self.cancel()
@@ -208,7 +209,6 @@ class RangeDownloader:
             self._debug('Unexpected exception: {!r}.'.format(exc))
             self.cancel()
         finally:
-            session.close()
             return self._state
 
     def _debug(self, msg, *args, **kwargs):
@@ -425,8 +425,7 @@ class ParallelHttpRequestHandler(aiohttp.server.ServerHttpProtocol):
         req_data = payload if not isinstance(payload, EmptyStreamReader) else None
 
         # Request from a host.
-        session = aiohttp.ClientSession(headers=message.headers, loop=self._loop)
-        try:
+        async with aiohttp.ClientSession(headers=message.headers, loop=self._loop) as session:
             async with session.request(message.method, message.path,
                                        data=req_data,
                                        allow_redirects=False) as host_resp:  # type: aiohttp.ClientResponse
@@ -456,8 +455,7 @@ class ParallelHttpRequestHandler(aiohttp.server.ServerHttpProtocol):
 
                 if client_res.chunked or client_res.autochunked():
                     await client_res.write_eof()
-        finally:
-            session.close()
+
         return client_res
 
     async def process_parallel(self, message: RawRequestMessage, payload) -> aiohttp.Response:
@@ -508,14 +506,12 @@ class ParallelHttpRequestHandler(aiohttp.server.ServerHttpProtocol):
 
     async def get_file_head(self, path: str) -> Optional[CIMultiDictProxy]:
         """Make a HEAD request to get a 'content-length' and 'accept-ranges' headers."""
-        session = aiohttp.ClientSession(loop=self._loop)
         try:
-            async with session.request(hdrs.METH_HEAD, path) as res:  # type: aiohttp.ClientResponse
-                return res.headers
+            async with aiohttp.ClientSession(loop=self._loop) as session:
+                async with session.request(hdrs.METH_HEAD, path) as res:  # type: aiohttp.ClientResponse
+                    return res.headers
         except (aiohttp.ServerDisconnectedError, aiohttp.ClientResponseError):
             self.log_debug("Could not get a HEAD for the {!r}.".format(path))
-        finally:
-            session.close()
         return None
 
     def get_client_address(self):
