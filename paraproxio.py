@@ -181,7 +181,7 @@ class RangeDownloader:
                     # Read content by chunks and write to the buffer file.
                     self._state = DOWNLOADING
                     while self._state is DOWNLOADING:
-                        with aiohttp.Timeout(self._chunk_download_timeout):
+                        with aiohttp.Timeout(self._chunk_download_timeout, loop=self._loop):
                             chunk = await res.content.read(self._chunk_size)
                             self._bytes_downloaded += len(chunk)
 
