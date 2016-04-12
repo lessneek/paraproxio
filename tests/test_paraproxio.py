@@ -17,6 +17,7 @@
 
 import asyncio
 import concurrent.futures
+import os
 import threading
 import time
 import unittest
@@ -37,8 +38,11 @@ PROXY_SERVER_HOST = '127.0.0.1'
 PROXY_SERVER_PORT = 28880
 PROXY_ADDRESS = 'http://%s:%s' % (PROXY_SERVER_HOST, PROXY_SERVER_PORT)
 
-TEST_WEB_SERVER_FILES = {'/testfile1.txt': bytes(range(0, 256))}
 CHUNK_SIZE = 64 * 1024
+
+TEST_WEB_SERVER_FILES = {
+    '/testfile1.txt': os.urandom(CHUNK_SIZE * 10 + CHUNK_SIZE // 3),
+    '/bigfile1.zip': os.urandom(CHUNK_SIZE * 1000 + CHUNK_SIZE // 3)}
 
 
 class TestRequestHandler(aiohttp.server.ServerHttpProtocol):
@@ -74,8 +78,16 @@ class LoopThread:
         self._state_changed = threading.Condition()
 
     @property
+    def name(self):
+        return None
+
+    @property
     def state(self):
         return self._state
+
+    @property
+    def loop(self):
+        return self._loop
 
     def run(self, loop, *args, **kwargs):
         pass
@@ -97,6 +109,7 @@ class LoopThread:
             # Create an event loop.
             loop = self._loop = asyncio.new_event_loop()  # type: BaseEventLoop
             loop.set_default_executor(executor)
+            asyncio.set_event_loop(None)
 
             # Schedule 'set started' on loop.
             loop.call_later(1, self._set_started)
@@ -106,7 +119,7 @@ class LoopThread:
                 self._state = STOPPED
                 self._state_changed.notify_all()
 
-    def start(self, *args, **kwargs):
+    def start(self, wait_until_started=True, *args, **kwargs):
         with self._state_changed:
             if self._state != STOPPED:
                 return
@@ -115,6 +128,14 @@ class LoopThread:
 
         self._worker_thread = threading.Thread(target=self._run, name=self.name, args=args, kwargs=kwargs)
         self._worker_thread.start()
+
+        if wait_until_started:
+            self.wait_until_started()
+
+    def wait_until_started(self, timeout=None):
+        with self._state_changed:
+            while self._state != STARTED:
+                self._state_changed.wait(timeout)
 
     def stopping(self):
         pass
@@ -137,14 +158,6 @@ class LoopThread:
             while loop.is_running():
                 time.sleep(1)
             loop.close()
-
-    @property
-    def name(self):
-        return None
-
-    @property
-    def loop(self):
-        return self._loop
 
 
 class TestWebServer(LoopThread):
@@ -188,6 +201,9 @@ def create_host_url(filename):
 
 class TestParaproxio(unittest.TestCase):
     def setUp(self):
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(None)
+
         # Start a web server.
         self.web_server = TestWebServer()
         self.web_server.start()
@@ -201,28 +217,20 @@ class TestParaproxio(unittest.TestCase):
         self.web_server.stop()
 
     def test_normal_get(self):
+        file_path = '/testfile1.txt'
         # Make a test request to the web server through the proxy.
-        async def test():
-            await asyncio.sleep(3)
-            connector = aiohttp.ProxyConnector(proxy=PROXY_ADDRESS)
-            session = aiohttp.client.ClientSession(connector=connector)
-            try:
-                url = create_host_url('/testfile1.txt')
+        async def go():
+            connector = aiohttp.ProxyConnector(proxy=PROXY_ADDRESS, loop=self.loop)
+            async with aiohttp.client.ClientSession(connector=connector, loop=self.loop) as session:
+                url = create_host_url(file_path)
                 async with session.get(url) as resp:  # type: aiohttp.ClientResponse
                     self.assertEqual(resp.status, 200)
                     content = await resp.read()
-                    self.assertEqual(content, TEST_WEB_SERVER_FILES.get('/testfile1.txt'))
-            finally:
-                session.close()
+                    self.assertEqual(content, TEST_WEB_SERVER_FILES.get(file_path))
 
-        loop = asyncio.get_event_loop()
-        try:
-            loop.run_until_complete(asyncio.ensure_future(test()))
-        except KeyboardInterrupt:
-            pass
+        self.loop.run_until_complete(go())
 
     def test_parallel_get(self):
-        # TODO: implement.
         pass
 
 
