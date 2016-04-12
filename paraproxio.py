@@ -425,38 +425,41 @@ class ParallelHttpRequestHandler(aiohttp.server.ServerHttpProtocol):
         req_data = payload if not isinstance(payload, EmptyStreamReader) else None
 
         # Request from a host.
-        async with aiohttp.ClientSession(headers=message.headers, loop=self._loop) as session:
-            async with session.request(message.method, message.path,
-                                       data=req_data,
-                                       allow_redirects=False) as host_resp:  # type: aiohttp.ClientResponse
-                client_res = aiohttp.Response(
-                    self.writer, host_resp.status, http_version=message.version)
+        try:
+            async with aiohttp.ClientSession(headers=message.headers, loop=self._loop) as session:
+                async with session.request(message.method, message.path,
+                                           data=req_data,
+                                           allow_redirects=False) as host_resp:  # type: aiohttp.ClientResponse
+                    client_res = aiohttp.Response(
+                        self.writer, host_resp.status, http_version=message.version)
 
-                # Process host response headers.
-                for name, value in host_resp.headers.items():
-                    if name == hdrs.CONTENT_ENCODING:
-                        continue
-                    if name == hdrs.CONTENT_LENGTH:
-                        continue
-                    if name == hdrs.TRANSFER_ENCODING:
-                        if value.lower() == 'chunked':
-                            client_res.enable_chunked_encoding()
-                    client_res.add_header(name, value)
+                    # Process host response headers.
+                    for name, value in host_resp.headers.items():
+                        if name == hdrs.CONTENT_ENCODING:
+                            continue
+                        if name == hdrs.CONTENT_LENGTH:
+                            continue
+                        if name == hdrs.TRANSFER_ENCODING:
+                            if value.lower() == 'chunked':
+                                client_res.enable_chunked_encoding()
+                        client_res.add_header(name, value)
 
-                # Send headers to the client.
-                client_res.send_headers()
+                    # Send headers to the client.
+                    client_res.send_headers()
 
-                # Send a payload.
-                while True:
-                    chunk = await host_resp.content.read(self._chunk_size)
-                    if not chunk:
-                        break
-                    client_res.write(chunk)
+                    # Send a payload.
+                    while True:
+                        chunk = await host_resp.content.read(self._chunk_size)
+                        if not chunk:
+                            break
+                        client_res.write(chunk)
 
-                if client_res.chunked or client_res.autochunked():
-                    await client_res.write_eof()
-
-        return client_res
+                    if client_res.chunked or client_res.autochunked():
+                        await client_res.write_eof()
+            return client_res
+        except aiohttp.ClientResponseError:
+            self.log_debug("CANCELLED {!s} {!r}.".format(message.method, message.path))
+            raise
 
     async def process_parallel(self, message: RawRequestMessage, payload) -> aiohttp.Response:
         """Try process a request parallel. Returns True in case of processed parallel, otherwise False."""
@@ -466,7 +469,7 @@ class ParallelHttpRequestHandler(aiohttp.server.ServerHttpProtocol):
         head = await self.get_file_head(message.path)
         if head is None:
             return None
-        accept_ranges = head.get(hdrs.ACCEPT_RANGES).lower() == 'bytes'
+        accept_ranges = head.get(hdrs.ACCEPT_RANGES).lower() == 'bytes'  # TODO: check for None.
         if not accept_ranges:
             return None
         content_length = head.get(hdrs.CONTENT_LENGTH)
@@ -477,7 +480,7 @@ class ParallelHttpRequestHandler(aiohttp.server.ServerHttpProtocol):
             return None
 
         # All checks pass, start a parallel downloading.
-        self.log_debug("PARALLEL GET {!r} [{!s} bytes]".format(message.path, content_length))
+        self.log_debug("PARALLEL GET {!r} [{!s} bytes].".format(message.path, content_length))
 
         # Get additional file info.
         content_type = head.get(hdrs.CONTENT_TYPE)
