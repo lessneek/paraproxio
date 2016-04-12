@@ -469,8 +469,8 @@ class ParallelHttpRequestHandler(aiohttp.server.ServerHttpProtocol):
         head = await self.get_file_head(message.path)
         if head is None:
             return None
-        accept_ranges = head.get(hdrs.ACCEPT_RANGES).lower() == 'bytes'  # TODO: check for None.
-        if not accept_ranges:
+        accept_ranges = head.get(hdrs.ACCEPT_RANGES)
+        if not accept_ranges or accept_ranges.lower() != 'bytes':
             return None
         content_length = head.get(hdrs.CONTENT_LENGTH)
         if content_length is None:
