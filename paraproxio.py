@@ -455,7 +455,7 @@ class ParallelHttpRequestHandler(aiohttp.server.ServerHttpProtocol):
                     client_res.write(chunk)
 
                 if client_res.chunked or client_res.autochunked():
-                    client_res.write_eof()
+                    await client_res.write_eof()
         finally:
             session.close()
         return client_res
@@ -497,7 +497,7 @@ class ParallelHttpRequestHandler(aiohttp.server.ServerHttpProtocol):
         try:
             await pd.download()
             await pd.read(lambda chunk: client_res.write(chunk))
-            client_res.write_eof()
+            await client_res.write_eof()
         except Exception as exc:
             self.log_debug("CANCELLED PARALLEL GET {!r}.".format(message.path))
             raise
