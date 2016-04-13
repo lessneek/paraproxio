@@ -69,7 +69,7 @@ DEFAULT_LOGS_DIR = os.path.join(DEFAULT_WORKING_DIR, 'logs')
 DEFAULT_SERVER_LOG_FILENAME = 'paraproxio.server.log'
 DEFAULT_ACCESS_LOG_FILENAME = 'paraproxio.access.log'
 
-DEFAULT_PARACCESS_LOG_FORMAT = '%a %l %u %t "%r" %s %b "%{Referrer}i" "%{User-Agent}i" %{Parallels}o'
+DEFAULT_PARACCESS_LOG_FORMAT = '%a %l %u %t "%r" %s %b "%{Referrer}i" "%{User-Agent}i" %{X-Parallels}o'
 
 PARALLELS_HEADER = 'X-Parallels'  # Used in responses. Value: number of parallel downloads used.
 
