@@ -500,7 +500,7 @@ class ParallelHttpRequestHandler(aiohttp.server.ServerHttpProtocol):
             await pd.read(lambda chunk: client_res.write(chunk))
             await client_res.write_eof()
         except Exception as exc:
-            self.log_debug("CANCELLED PARALLEL GET {!r}.".format(message.path))
+            self.log_debug("CANCELLED PARALLEL GET {!r}. Caused by exception: {!r}.".format(message.path, exc))
             raise
         finally:
             await pd.clear()
