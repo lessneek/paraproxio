@@ -18,15 +18,18 @@
 import asyncio
 import concurrent.futures
 import os
+import re
 import threading
 import time
 import unittest
 from asyncio import BaseEventLoop
+from collections import namedtuple
+from typing import Callable
 from urllib.parse import urlparse, ParseResult
 
 import aiohttp.client
 import aiohttp.server
-from aiohttp import RawRequestMessage, hdrs
+from aiohttp import RawRequestMessage, hdrs, ClientResponse
 
 import paraproxio
 
@@ -40,28 +43,68 @@ PROXY_ADDRESS = 'http://%s:%s' % (PROXY_SERVER_HOST, PROXY_SERVER_PORT)
 
 CHUNK_SIZE = 64 * 1024
 
+SMALL_FILE_PATH = '/testfile1.txt'
+BIG_FILE_PATH = '/bigfile1.zip'
+
 TEST_WEB_SERVER_FILES = {
-    '/testfile1.txt': os.urandom(CHUNK_SIZE * 10 + CHUNK_SIZE // 3),
-    '/bigfile1.zip': os.urandom(CHUNK_SIZE * 1000 + CHUNK_SIZE // 3)}
+    SMALL_FILE_PATH: os.urandom(1009),
+    BIG_FILE_PATH: os.urandom(1000999)}
+
+RANGERE = re.compile(r'^bytes=(\d+)-(\d+)$', re.I | re.A)
+
+BytesRange = namedtuple('BytesRange', ['start', 'stop'])
 
 
 class TestRequestHandler(aiohttp.server.ServerHttpProtocol):
     async def handle_request(self, message: RawRequestMessage, payload):
-        if message.method != 'GET':
+        if message.method not in ['GET', 'HEAD']:
             return
+
+        head = message.method == 'HEAD'
         pr = urlparse(message.path)  # type: ParseResult
         filename = pr.path
 
         file_bytes = TEST_WEB_SERVER_FILES.get(filename)
         if file_bytes is None:
-            self.handle_error(404, 'Not found.')
+            await self.handle_error(404, 'Not found.')
+            return
 
-        file_len = len(file_bytes)
-        client_res = aiohttp.Response(
-            self.writer, 200, http_version=message.version)
-        client_res.add_header(hdrs.CONTENT_LENGTH, str(file_len))
+        content_length = file_len = len(file_bytes)
+
+        bytes_range = message.headers.get('Range')
+        try:
+            if bytes_range:
+                m = RANGERE.match(bytes_range)
+                if not m:
+                    raise RuntimeError('Wrong range.')
+                bytes_range = BytesRange(int(m.group(1)), int(m.group(2)))
+                content_length = bytes_range.stop - bytes_range.start + 1
+                if content_length <= 0 or bytes_range.stop >= file_len:
+                    raise RuntimeError('Wrong range.')
+
+        except RuntimeError as exc:
+            await self.handle_error(400, exc=exc)
+            return
+
+        status = 206 if bytes_range else 200
+
+        client_res = aiohttp.Response(self.writer, status, http_version=message.version)
+        client_res.add_header(hdrs.CONTENT_LENGTH, str(content_length))
+
+        content = None
+
+        if head:
+            client_res.add_header(hdrs.ACCEPT_RANGES, 'bytes')
+        else:
+            if bytes_range:
+                content = file_bytes[bytes_range.start:bytes_range.stop + 1]
+                client_res.add_header(hdrs.CONTENT_RANGE, 'bytes {0[0]}-{0[1]}/{1}'.format(bytes_range, file_len))
+            else:
+                content = file_bytes
+
         client_res.send_headers()
-        client_res.write(file_bytes)
+        if content:
+            client_res.write(content)
         await client_res.write_eof()
 
 
@@ -200,6 +243,8 @@ def create_host_url(filename):
 
 
 class TestParaproxio(unittest.TestCase):
+    parallels = '8'
+
     def setUp(self):
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(None)
@@ -209,29 +254,42 @@ class TestParaproxio(unittest.TestCase):
         self.web_server.start()
 
         # Start a proxy server.
+        # TODO: fix multiple logging setup.
         self.proxy_server = TestParaproxioServer()
-        self.proxy_server.start(args=['--host', PROXY_SERVER_HOST, '--port', str(PROXY_SERVER_PORT)])
+        self.proxy_server.start(
+            args=['--host', PROXY_SERVER_HOST,
+                  '--port', str(PROXY_SERVER_PORT),
+                  '--parallels', self.parallels,
+                  '--debug'])
 
     def tearDown(self):
         self.proxy_server.stop()
         self.web_server.stop()
 
-    def test_normal_get(self):
-        file_path = '/testfile1.txt'
-        # Make a test request to the web server through the proxy.
-        async def go():
-            connector = aiohttp.ProxyConnector(proxy=PROXY_ADDRESS, loop=self.loop)
-            async with aiohttp.client.ClientSession(connector=connector, loop=self.loop) as session:
-                url = create_host_url(file_path)
-                async with session.get(url) as resp:  # type: aiohttp.ClientResponse
-                    self.assertEqual(resp.status, 200)
-                    content = await resp.read()
-                    self.assertEqual(content, TEST_WEB_SERVER_FILES.get(file_path))
+    async def _go(self, file_path, check_resp: Callable[[ClientResponse], None] = None):
+        """ Make a test request to the web server through the proxy."""
+        connector = aiohttp.ProxyConnector(proxy=PROXY_ADDRESS, loop=self.loop)
+        async with aiohttp.client.ClientSession(connector=connector, loop=self.loop) as session:
+            url = create_host_url(file_path)
+            async with session.get(url) as resp:  # type: ClientResponse
+                self.assertEqual(resp.status, 200)
+                content = await resp.read()
+                self.assertEqual(content, TEST_WEB_SERVER_FILES.get(file_path))
+                if check_resp:
+                    check_resp(resp)
+                time.sleep(1)  # Wait a little bit before closing the session.
 
-        self.loop.run_until_complete(go())
+    def test_normal_get(self):
+        def check_resp(resp: aiohttp.ClientResponse):
+            self.assertEqual(resp.headers.get(paraproxio.PARALLELS_HEADER), None)
+
+        self.loop.run_until_complete(self._go(SMALL_FILE_PATH, check_resp))
 
     def test_parallel_get(self):
-        pass
+        def check_resp(resp: aiohttp.ClientResponse):
+            self.assertEqual(resp.headers.get(paraproxio.PARALLELS_HEADER), self.parallels)
+
+        self.loop.run_until_complete(self._go(BIG_FILE_PATH, check_resp))
 
 
 if __name__ == "__main__":
