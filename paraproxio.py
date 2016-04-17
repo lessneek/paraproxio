@@ -211,10 +211,6 @@ class RangeDownloader:
         finally:
             return self._state
 
-    def _debug(self, msg, *args, **kwargs):
-        msg = "{!r} {!s}".format(self, msg)
-        self._server_logger.debug(msg, *args, **kwargs)
-
     def cancel(self):
         if self._state != DOWNLOADING:
             return
@@ -244,6 +240,10 @@ class RangeDownloader:
         f.seek(0)
         self._buffer_file = f
 
+    def _debug(self, msg, *args, **kwargs):
+        msg = "{!r} {!s}".format(self, msg)
+        self._server_logger.debug(msg, *args, **kwargs)
+
     def __repr__(self, *args, **kwargs):
         return '<RangeDownloader: [{0[0]!s}-{0[1]!s}] {1!r}>'.format(self._bytes_range, self._path)
 
@@ -257,6 +257,7 @@ class ParallelDownloader:
             parallels: int = DEFAULT_PARALLELS,
             chunk_size: int = DEFAULT_CHUNK_SIZE,
             loop: AbstractEventLoop = None,
+            server_logger=server_logger,
             buffer_dir: str = DEFAULT_BUFFER_DIR):
         assert parallels > 1
 
@@ -265,6 +266,7 @@ class ParallelDownloader:
         self._parallels = parallels
         self._chunk_size = chunk_size
         self._loop = loop if loop is not None else asyncio.get_event_loop()
+        self._server_logger = server_logger
         self._filename = None  # type: str
         self._download_dir = os.path.join(buffer_dir, str(self._loop.time()).replace('.', '_'))
         self._downloaders = []  # type: List[RangeDownloader]
@@ -312,6 +314,7 @@ class ParallelDownloader:
                         raise CancelledError()
 
         except Exception as ex:
+            self._debug('Download failed. Error: {!r}.'.format(ex))
             self.cancel()
             raise
         else:
@@ -353,6 +356,10 @@ class ParallelDownloader:
     def _create_download_dir(self):
         if not os.path.exists(self._download_dir):
             os.makedirs(self._download_dir)
+
+    def _debug(self, msg, *args, **kwargs):
+        msg = "{!r} {!s}".format(self, msg)
+        self._server_logger.debug(msg, *args, **kwargs)
 
     def __repr__(self, *args, **kwargs):
         return '<ParallelDownloader: {!r}>'.format(self._path)
