@@ -48,7 +48,7 @@ BIG_FILE_PATH = '/bigfile1.zip'
 
 TEST_WEB_SERVER_FILES = {
     SMALL_FILE_PATH: os.urandom(1009),
-    BIG_FILE_PATH: os.urandom(1000999)}
+    BIG_FILE_PATH: os.urandom(100000999)}
 
 RANGERE = re.compile(r'^bytes=(\d+)-(\d+)$', re.I | re.A)
 
@@ -244,7 +244,7 @@ def create_host_url(filename):
 
 
 class TestParaproxio(unittest.TestCase):
-    parallels = '8'
+    parallels = '3'
 
     def setUp(self):
         self.loop = asyncio.new_event_loop()
@@ -268,13 +268,16 @@ class TestParaproxio(unittest.TestCase):
 
     async def _go(self, file_path, check_resp: Callable[[ClientResponse], None] = None):
         """ Make a test request to the web server through the proxy."""
+        expected_content = TEST_WEB_SERVER_FILES.get(file_path)
+        expected_content_length = len(expected_content)
         connector = aiohttp.ProxyConnector(proxy=PROXY_ADDRESS, loop=self.loop)
         async with aiohttp.client.ClientSession(connector=connector, loop=self.loop) as session:
             url = create_host_url(file_path)
             async with session.get(url) as resp:  # type: ClientResponse
                 self.assertEqual(resp.status, 200)
+                self.assertEqual(resp.headers.get(hdrs.CONTENT_LENGTH), str(expected_content_length))
                 content = await resp.read()
-                self.assertEqual(content, TEST_WEB_SERVER_FILES.get(file_path))
+                self.assertEqual(content, expected_content)
                 if check_resp:
                     check_resp(resp)
                 time.sleep(1)  # Wait a little bit before closing the session.
@@ -290,6 +293,21 @@ class TestParaproxio(unittest.TestCase):
             self.assertEqual(resp.headers.get(paraproxio.PARALLELS_HEADER), self.parallels)
 
         self.loop.run_until_complete(self._go(BIG_FILE_PATH, check_resp))
+
+
+class TestGetBytesRanges(unittest.TestCase):
+    def test_get_bytes_ranges_by_part_size(self):
+        cases = [(100, 50, [(0, 49), (50, 99)]),
+                 (101, 50, [(0, 49), (50, 99), (100, 100)]),
+                 (102, 50, [(0, 49), (50, 99), (100, 101)]),
+                 (103, 50, [(0, 49), (50, 99), (100, 102)]),
+                 (101, 49, [(0, 48), (49, 97), (98, 100)])]
+
+        for length, part_size, expected_bytes_ranges in cases:
+            actual_bytes_ranges = paraproxio.get_bytes_ranges_by_part_size(length, part_size)
+            self.assertEqual(actual_bytes_ranges, expected_bytes_ranges,
+                             'length={!s}, part_size={!s}, expected_bytes_ranges={!r}, actual_bytes_ranges={!r}.'
+                             .format(length, part_size, expected_bytes_ranges, actual_bytes_ranges))
 
 
 if __name__ == "__main__":

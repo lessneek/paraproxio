@@ -39,7 +39,7 @@ import concurrent.futures
 
 from asyncio import AbstractEventLoop, Future
 from asyncio.futures import CancelledError
-from typing import Tuple, Callable, Optional, List
+from typing import Tuple, Callable, Optional, List, Set
 from urllib.parse import urlparse, ParseResult
 
 try:
@@ -62,6 +62,7 @@ DEFAULT_CHUNK_DOWNLOAD_TIMEOUT = 10
 DEFAULT_CHUNK_SIZE = 64 * 1024
 DEFAULT_PARALLELS = 32
 DEFAULT_MAX_WORKERS = 8
+DEFAULT_PART_SIZE = DEFAULT_CHUNK_SIZE * DEFAULT_PARALLELS * DEFAULT_MAX_WORKERS
 
 DEFAULT_WORKING_DIR = '.paraproxio'
 DEFAULT_BUFFER_DIR = os.path.join(DEFAULT_WORKING_DIR, 'buffer')
@@ -92,19 +93,8 @@ def need_file_to_parallel(path: str) -> bool:
     return ext.lower() in files_to_parallel
 
 
-def get_bytes_ranges(length: int, parts: int) -> List[Tuple[int, int]]:
+def get_bytes_ranges_by_parts(length: int, parts: int) -> List[Tuple[int, int]]:
     """ Get bytes ranges """
-    ###################################################################################################
-    #
-    # length            = 89
-    # parts             = 4
-    # range_size        = length // parts = 89 // 4 = 22
-    # last_range_size   = range_size + length % parts = 22 + 89 % 4 = 22 + 1 = 23
-    #
-    # [<-----range_size----->|<-----range_size----->|<-----range_size----->|<---last_range_size---->|
-    # [**********************|**********************|**********************|**********************|*]
-    # 0                      22                     44                     66                    88 89
-    #
     ###################################################################################################
     #
     # length            = 89
@@ -117,7 +107,6 @@ def get_bytes_ranges(length: int, parts: int) -> List[Tuple[int, int]]:
     # 0                 17                34                51                68                85   89
     #
     ###################################################################################################
-
     range_size = length // parts
     last_range_size = range_size + length % parts
     last_range_idx = parts - 1
@@ -127,6 +116,16 @@ def get_bytes_ranges(length: int, parts: int) -> List[Tuple[int, int]]:
         bytes_ranges.append(bytes_range)
     last_range_offset = last_range_idx * range_size
     bytes_ranges.append((last_range_offset, last_range_offset + last_range_size - 1))
+    return bytes_ranges
+
+
+def get_bytes_ranges_by_part_size(length: int, part_size: int) -> List[Tuple[int, int]]:
+    bytes_ranges = []
+    for offset in range(0, length, part_size):
+        left = length - offset
+        if left < part_size:
+            part_size = left
+        bytes_ranges.append((offset, offset + part_size - 1))
     return bytes_ranges
 
 
@@ -144,7 +143,7 @@ class RangeDownloader:
         self._path = path
         self._bytes_range = bytes_range
         self._length = bytes_range[1] - bytes_range[0] + 1
-        self.buffer_file_path = buffer_file_path
+        self._buffer_file_path = buffer_file_path
         self._loop = loop if loop is not None else asyncio.get_event_loop()
         self._server_logger = server_logger
         self._chunk_size = chunk_size
@@ -160,6 +159,10 @@ class RangeDownloader:
     @property
     def bytes_downloaded(self):
         return self._bytes_downloaded
+
+    @property
+    def buffer_file_path(self):
+        return self._buffer_file_path
 
     async def download(self) -> str:
         # Prepare an empty buffer file.
@@ -233,7 +236,7 @@ class RangeDownloader:
         return self._loop.run_in_executor(None, lambda: func())
 
     def _create_buffer_file(self):
-        f = open(self.buffer_file_path, 'xb')
+        f = open(self._buffer_file_path, 'xb')
         f.seek(self._length - 1)
         f.write(b'0')
         f.flush()
@@ -254,6 +257,7 @@ class ParallelDownloader:
             path: str,
             file_length: int,
             *,
+            part_size: int = DEFAULT_PART_SIZE,
             parallels: int = DEFAULT_PARALLELS,
             chunk_size: int = DEFAULT_CHUNK_SIZE,
             loop: AbstractEventLoop = None,
@@ -263,6 +267,7 @@ class ParallelDownloader:
 
         self._path = path
         self._file_length = file_length
+        self._part_size = part_size
         self._parallels = parallels
         self._chunk_size = chunk_size
         self._loop = loop if loop is not None else asyncio.get_event_loop()
@@ -270,9 +275,17 @@ class ParallelDownloader:
         self._filename = None  # type: str
         self._download_dir = os.path.join(buffer_dir, str(self._loop.time()).replace('.', '_'))
         self._downloaders = []  # type: List[RangeDownloader]
-        self._downloads = []  # type: List[Future]
+        self._downloads = set()  # type: Set[Future]
         self._state = NOT_STARTED
         self._create_download_dir()
+
+        # Calculate bytes ranges.
+        self._bytes_ranges = get_bytes_ranges_by_part_size(self._file_length, self._part_size)
+        self._parts = len(self._bytes_ranges)
+
+        if self._parts < self._parallels:
+            self._bytes_ranges = get_bytes_ranges_by_parts(self._file_length, self._parallels)
+            self._parts = len(self._bytes_ranges)
 
     @property
     def state(self) -> str:
@@ -286,11 +299,8 @@ class ParallelDownloader:
         assert self._state == NOT_STARTED
         self._state = DOWNLOADING
 
-        # Calculate bytes ranges.
-        bytes_ranges = get_bytes_ranges(self._file_length, self._parallels)
-
         # Create a downloader for each bytes range.
-        for i, bytes_range in enumerate(bytes_ranges):
+        for i, bytes_range in enumerate(self._bytes_ranges):
             filename = '{idx:02}_{range[0]!s}-{range[1]!s}.tmp'.format(idx=i, range=bytes_range)
             buffer_file_path = os.path.join(self._download_dir, filename)
             self._downloaders.append(
@@ -300,18 +310,30 @@ class ParallelDownloader:
                                 loop=self._loop,
                                 chunk_size=self._chunk_size))
 
-        # Start downloaders.
-        for downloader in self._downloaders:
-            self._downloads.append(asyncio.ensure_future(downloader.download(), loop=self._loop))
+        def start_download(downloader: RangeDownloader):
+            self._downloads.add(asyncio.ensure_future(downloader.download(), loop=self._loop))
+
+        # Start parallel downloaders for first parts.
+        for i in range(0, self._parallels):
+            downloader = self._downloaders[i]
+            start_download(downloader)
+
+        next_id = self._parallels
 
         # Waiting for all downloads to complete.
         try:
-            pending = set(self._downloads)
-            while self._state is DOWNLOADING and pending:
-                done, pending = await asyncio.wait(pending, loop=self._loop, return_when=asyncio.FIRST_COMPLETED)
+            while self._state is DOWNLOADING and self._downloads:
+                done, self._downloads = await asyncio.wait(self._downloads, loop=self._loop,
+                                                           return_when=asyncio.FIRST_COMPLETED)
                 for dd in done:  # type: Future
+                    # Cancel downloading if any of completed downloads is not downloaded.
                     if dd.result() is not DOWNLOADED:
                         raise CancelledError()
+                    # Start next downloader if any.
+                    if next_id < self._parts:
+                        downloader = self._downloaders[next_id]
+                        start_download(downloader)
+                        next_id += 1
 
         except Exception as ex:
             self._debug('Download failed. Error: {!r}.'.format(ex))
@@ -483,7 +505,7 @@ class ParallelHttpRequestHandler(aiohttp.server.ServerHttpProtocol):
         if content_length is None:
             return None
         content_length = int(content_length)
-        if content_length <= 0:
+        if content_length <= 0 or content_length < DEFAULT_PART_SIZE:
             return None
 
         # All checks pass, start a parallel downloading.
