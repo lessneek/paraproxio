@@ -231,7 +231,8 @@ class TestParaproxioServer(LoopThread):
         super().__init__()
 
     def run(self, loop, *args, **kwargs):
-        paraproxio.run(args=kwargs['args'], loop=loop)
+        ppx = paraproxio.Paraproxio(args=kwargs['args'], loop=loop)
+        ppx.run_forever()
 
     @property
     def name(self):
@@ -254,7 +255,6 @@ class TestParaproxio(unittest.TestCase):
         self.web_server.start()
 
         # Start a proxy server.
-        # TODO: fix multiple logging setup.
         self.proxy_server = TestParaproxioServer()
         self.proxy_server.start(
             args=['--host', PROXY_SERVER_HOST,

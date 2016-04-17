@@ -616,34 +616,6 @@ def setup_dirs(*dirs):
         os.makedirs(d, exist_ok=True)
 
 
-def setup_logging(
-        logs_dir: str,
-        server_log_filename: str,
-        access_log_filename: str,
-        *,
-        debug=False):
-    # Set levels.
-    level = logging.DEBUG if debug else logging.INFO
-    server_logger.setLevel(level)
-    access_logger.setLevel(level)
-
-    # stderr handler.
-    ch = logging.StreamHandler(sys.stderr)
-    ch.setLevel(level)
-    server_logger.addHandler(ch)
-    access_logger.addHandler(ch)
-
-    # Server log file handler.
-    slfh = logging.FileHandler(os.path.join(logs_dir, server_log_filename))
-    slfh.setLevel(level)
-    server_logger.addHandler(slfh)
-
-    # Access log file handler.
-    alfh = logging.FileHandler(os.path.join(logs_dir, access_log_filename))
-    alfh.setLevel(level)
-    access_logger.addHandler(alfh)
-
-
 def get_args(args):
     parser = argparse.ArgumentParser(prog="paraproxio",
                                      description="An HTTP proxy with a parallel downloading of big files.")
@@ -659,47 +631,90 @@ def get_args(args):
     return parser.parse_args(args)
 
 
-def run(args=None, loop=None):
-    args = get_args(args)
+class Paraproxio:
+    def __init__(self, args=None, loop=None, enable_logging=True):
+        self._args = get_args(args)
+        self._loop = loop
+        self._enable_logging = enable_logging
 
-    setup_dirs(args.buffer_dir, args.logs_dir)
-    setup_logging(args.logs_dir,
-                  DEFAULT_SERVER_LOG_FILENAME,
-                  DEFAULT_ACCESS_LOG_FILENAME,
-                  debug=args.debug)
+        setup_dirs(self._args.buffer_dir, self._args.logs_dir)
 
-    autoclose_loop = False
+        # Create an event loop.
+        self._autoclose_loop = False
+        if self._loop is None:
+            self._autoclose_loop = True
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(None)
+            # Create custom executor.
+            executor = concurrent.futures.ThreadPoolExecutor(self._args.max_workers)
+            self._loop.set_default_executor(executor)
 
-    # Create an event loop.
-    if loop is None:
-        autoclose_loop = True
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(None)
-        # Create custom executor.
-        executor = concurrent.futures.ThreadPoolExecutor(args.max_workers)
-        loop.set_default_executor(executor)
+        if self._enable_logging:
+            self._setup_logging(self._args.logs_dir,
+                                DEFAULT_SERVER_LOG_FILENAME,
+                                DEFAULT_ACCESS_LOG_FILENAME,
+                                debug=self._args.debug)
 
-    handler_factory = ParallelHttpRequestHandlerFactory(loop=loop, debug=args.debug,
-                                                        parallels=args.parallels,
-                                                        chunk_size=args.chunk_size,
-                                                        keep_alive=75)
+    def run_forever(self):
+        handler_factory = ParallelHttpRequestHandlerFactory(loop=self._loop, debug=self._args.debug,
+                                                            parallels=self._args.parallels,
+                                                            chunk_size=self._args.chunk_size,
+                                                            keep_alive=75)
 
-    srv = loop.run_until_complete(loop.create_server(handler_factory, args.host, args.port))
-    print('Paraproxio serving on', srv.sockets[0].getsockname())
-    if args.debug:
-        print('Debug mode.')
-    try:
-        loop.run_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        srv.close()
-        loop.run_until_complete(srv.wait_closed())
-        loop.run_until_complete(handler_factory.finish_connections(timeout=15))
+        srv = self._loop.run_until_complete(self._loop.create_server(handler_factory, self._args.host, self._args.port))
+        print('Paraproxio serving on', srv.sockets[0].getsockname())
+        if self._args.debug:
+            print('Debug mode.')
+        try:
+            self._loop.run_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            srv.close()
+            self._loop.run_until_complete(srv.wait_closed())
+            self._loop.run_until_complete(handler_factory.finish_connections(timeout=15))
 
-    if autoclose_loop:
-        loop.close()
+        if self._autoclose_loop:
+            self._loop.close()
+
+        if self._enable_logging:
+            self._release_logging()
+
+    def _setup_logging(
+            self,
+            logs_dir: str,
+            server_log_filename: str,
+            access_log_filename: str,
+            *,
+            debug=False):
+        # Set levels.
+        level = logging.DEBUG if debug else logging.INFO
+        server_logger.setLevel(level)
+        access_logger.setLevel(level)
+
+        # stderr handler.
+        self._stderr_handler = logging.StreamHandler(sys.stderr)
+        self._stderr_handler.setLevel(level)
+        server_logger.addHandler(self._stderr_handler)
+        access_logger.addHandler(self._stderr_handler)
+
+        # Server log file handler.
+        self._sl_handler = logging.FileHandler(os.path.join(logs_dir, server_log_filename))
+        self._sl_handler.setLevel(level)
+        server_logger.addHandler(self._sl_handler)
+
+        # Access log file handler.
+        self._al_handler = logging.FileHandler(os.path.join(logs_dir, access_log_filename))
+        self._al_handler.setLevel(level)
+        access_logger.addHandler(self._al_handler)
+
+    def _release_logging(self):
+        server_logger.removeHandler(self._stderr_handler)
+        access_logger.removeHandler(self._stderr_handler)
+        server_logger.removeHandler(self._sl_handler)
+        access_logger.removeHandler(self._al_handler)
 
 
 if __name__ == '__main__':
-    run()
+    paraproxio = Paraproxio()
+    paraproxio.run_forever()
