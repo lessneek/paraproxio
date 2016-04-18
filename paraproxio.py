@@ -378,7 +378,7 @@ class ParallelDownloader:
 
     def _create_download_dir(self):
         if not os.path.exists(self._download_dir):
-            os.makedirs(self._download_dir)
+            os.makedirs(self._download_dir, exist_ok=True)
 
     def _debug(self, msg, *args, **kwargs):
         msg = "{!r} {!s}".format(self, msg)
