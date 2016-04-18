@@ -257,8 +257,8 @@ class ParallelDownloader:
             path: str,
             file_length: int,
             *,
-            part_size: int = DEFAULT_PART_SIZE,
             parallels: int = DEFAULT_PARALLELS,
+            part_size: int = DEFAULT_PART_SIZE,
             chunk_size: int = DEFAULT_CHUNK_SIZE,
             loop: AbstractEventLoop = None,
             server_logger=server_logger,
@@ -417,6 +417,7 @@ class ParallelHttpRequestHandler(aiohttp.server.ServerHttpProtocol):
             debug=False,
             log=None,
             parallels: int = DEFAULT_PARALLELS,
+            part_size: int = DEFAULT_PART_SIZE,
             chunk_size: int = DEFAULT_CHUNK_SIZE,
             **kwargs):
         super().__init__(
@@ -434,6 +435,7 @@ class ParallelHttpRequestHandler(aiohttp.server.ServerHttpProtocol):
         self._manager = manager
         self._loop = loop
         self._parallels = parallels
+        self._part_size = part_size
         self._chunk_size = chunk_size
 
     def connection_made(self, transport):
@@ -541,7 +543,10 @@ class ParallelHttpRequestHandler(aiohttp.server.ServerHttpProtocol):
         client_res.send_headers()
 
         pd = ParallelDownloader(message.path, content_length,
-                                parallels=self._parallels, chunk_size=self._chunk_size, loop=self._loop)
+                                parallels=self._parallels,
+                                part_size=self._part_size,
+                                chunk_size=self._chunk_size,
+                                loop=self._loop)
         try:
             downloading = asyncio.ensure_future(pd.download(), loop=self._loop)
             reading = asyncio.ensure_future(pd.read(lambda chunk: client_res.write(chunk)), loop=self._loop)
@@ -663,6 +668,7 @@ def get_args(args):
     parser.add_argument("-H", "--host", type=str, default=DEFAULT_HOST, help="host address")
     parser.add_argument("-P", "--port", type=int, default=DEFAULT_PORT, help="port")
     parser.add_argument("--parallels", type=int, default=DEFAULT_PARALLELS, help="parallel downloads of a big file")
+    parser.add_argument("--part-size", type=int, default=DEFAULT_PART_SIZE, help="part size of a parallel download")
     parser.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS, help="max workers of executor")
     parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE, help="chunk size")
     parser.add_argument("--buffer-dir", type=str, default=DEFAULT_BUFFER_DIR, help="buffer dir")
@@ -699,6 +705,7 @@ class Paraproxio:
     def run_forever(self):
         handler_factory = ParallelHttpRequestHandlerFactory(loop=self._loop, debug=self._args.debug,
                                                             parallels=self._args.parallels,
+                                                            part_size=self._args.part_size,
                                                             chunk_size=self._args.chunk_size,
                                                             keep_alive=75)
 
