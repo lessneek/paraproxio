@@ -252,6 +252,8 @@ class RangeDownloader:
 
 
 class ParallelDownloader:
+    next_id = 0
+
     def __init__(
             self,
             path: str,
@@ -310,15 +312,9 @@ class ParallelDownloader:
                                 loop=self._loop,
                                 chunk_size=self._chunk_size))
 
-        def start_download(downloader: RangeDownloader):
-            self._downloads.add(asyncio.ensure_future(downloader.download(), loop=self._loop))
-
         # Start parallel downloaders for first parts.
         for i in range(0, self._parallels):
-            downloader = self._downloaders[i]
-            start_download(downloader)
-
-        next_id = self._parallels
+            self._start_next_downloader()
 
         # Waiting for all downloads to complete.
         try:
@@ -330,10 +326,7 @@ class ParallelDownloader:
                     if dd.result() is not DOWNLOADED:
                         raise CancelledError()
                     # Start next downloader if any.
-                    if next_id < self._parts:
-                        downloader = self._downloaders[next_id]
-                        start_download(downloader)
-                        next_id += 1
+                    self._start_next_downloader()
 
         except Exception as ex:
             self._debug('Download failed. Error: {!r}.'.format(ex))
@@ -342,6 +335,13 @@ class ParallelDownloader:
         else:
             # OK. All done.
             self._state = DOWNLOADED
+
+    def _start_next_downloader(self):
+        if self.next_id >= self._parts:
+            return
+        downloader = self._downloaders[self.next_id]
+        self.next_id += 1
+        self._downloads.add(asyncio.ensure_future(downloader.download(), loop=self._loop))
 
     async def read(self, callback: Callable[[bytearray], None]):
         chunk = bytearray(self._chunk_size)
