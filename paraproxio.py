@@ -252,8 +252,6 @@ class RangeDownloader:
 
 
 class ParallelDownloader:
-    next_id = 0
-
     def __init__(
             self,
             path: str,
@@ -288,6 +286,9 @@ class ParallelDownloader:
         if self._parts < self._parallels:
             self._bytes_ranges = get_bytes_ranges_by_parts(self._file_length, self._parallels)
             self._parts = len(self._bytes_ranges)
+
+        # Next index of a downloader.
+        self._next_id = 0
 
     @property
     def state(self) -> str:
@@ -337,10 +338,10 @@ class ParallelDownloader:
             self._state = DOWNLOADED
 
     def _start_next_downloader(self):
-        if self.next_id >= self._parts:
+        if self._next_id >= self._parts:
             return
-        downloader = self._downloaders[self.next_id]
-        self.next_id += 1
+        downloader = self._downloaders[self._next_id]
+        self._next_id += 1
         self._downloads.add(asyncio.ensure_future(downloader.download(), loop=self._loop))
 
     async def read(self, callback: Callable[[bytearray], None]):
