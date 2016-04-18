@@ -290,6 +290,8 @@ class ParallelDownloader:
         # Next index of a downloader.
         self._next_id = 0
 
+        self._downloaded_condition = asyncio.Condition(loop=self._loop)
+
     @property
     def state(self) -> str:
         return self._state
@@ -314,7 +316,7 @@ class ParallelDownloader:
                                 chunk_size=self._chunk_size))
 
         # Start parallel downloaders for first parts.
-        for i in range(0, self._parallels):
+        for _ in range(0, self._parallels):
             self._start_next_downloader()
 
         # Waiting for all downloads to complete.
@@ -328,6 +330,10 @@ class ParallelDownloader:
                         raise CancelledError()
                     # Start next downloader if any.
                     self._start_next_downloader()
+
+                # Notify all readers.
+                async with self._downloaded_condition:
+                    self._downloaded_condition.notify_all()
 
         except Exception as ex:
             self._debug('Download failed. Error: {!r}.'.format(ex))
@@ -347,7 +353,18 @@ class ParallelDownloader:
     async def read(self, callback: Callable[[bytearray], None]):
         chunk = bytearray(self._chunk_size)
         chunk_size = len(chunk)
+
         for downloader in self._downloaders:
+
+            # Wait until downloader is not in a downloaded/cancelled state.
+            async with self._downloaded_condition:
+                while downloader.state not in (DOWNLOADED, CANCELLED):
+                    await self._downloaded_condition.wait()
+                if downloader.state != DOWNLOADED:
+                    self._debug('Downloader not in `DOWNLOADED` state, but in `{!s}`.'.format(downloader.state))
+                    return
+
+            # Open file and send all its bytes it to back.
             with open(downloader.buffer_file_path, 'rb') as file:
                 while True:
                     r = await self._run_nonblocking(lambda: file.readinto(chunk))
@@ -526,8 +543,9 @@ class ParallelHttpRequestHandler(aiohttp.server.ServerHttpProtocol):
         pd = ParallelDownloader(message.path, content_length,
                                 parallels=self._parallels, chunk_size=self._chunk_size, loop=self._loop)
         try:
-            await pd.download()
-            await pd.read(lambda chunk: client_res.write(chunk))
+            downloading = asyncio.ensure_future(pd.download(), loop=self._loop)
+            reading = asyncio.ensure_future(pd.read(lambda chunk: client_res.write(chunk)), loop=self._loop)
+            await asyncio.wait([downloading, reading], loop=self._loop)
             await client_res.write_eof()
         except Exception as exc:
             self.log_debug("CANCELLED PARALLEL GET {!r}. Caused by exception: {!r}.".format(message.path, exc))
