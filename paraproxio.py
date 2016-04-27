@@ -17,7 +17,6 @@ Paraproxio is an HTTP proxy with a parallel downloading of big files.
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-
 __version__ = '1.0'
 PARAPROXIO_VERSION = "Paraproxio/" + __version__
 
@@ -36,10 +35,13 @@ import os
 import shutil
 import argparse
 import concurrent.futures
+from collections import namedtuple
+import json
+from time import time
 
-from asyncio import AbstractEventLoop, Future
+from asyncio import AbstractEventLoop, Future, ensure_future, wait, wait_for, TimeoutError
 from asyncio.futures import CancelledError
-from typing import Tuple, Callable, Optional, List, Set
+from typing import Tuple, Callable, Optional, List, Set, Dict, Any
 from urllib.parse import urlparse, ParseResult
 
 try:
@@ -66,6 +68,7 @@ DEFAULT_PART_SIZE = DEFAULT_CHUNK_SIZE * DEFAULT_PARALLELS * DEFAULT_MAX_WORKERS
 
 DEFAULT_WORKING_DIR = '.paraproxio'
 DEFAULT_BUFFER_DIR = os.path.join(DEFAULT_WORKING_DIR, 'buffer')
+DEFAULT_CACHE_DIR = os.path.join(DEFAULT_WORKING_DIR, 'cache')
 DEFAULT_LOGS_DIR = os.path.join(DEFAULT_WORKING_DIR, 'logs')
 DEFAULT_SERVER_LOG_FILENAME = 'paraproxio.server.log'
 DEFAULT_ACCESS_LOG_FILENAME = 'paraproxio.access.log'
@@ -86,10 +89,13 @@ _DOWNLOADER_STATES = {NOT_STARTED, DOWNLOADING, DOWNLOADED, CANCELLED}
 
 files_to_parallel = ['.iso', '.zip', '.rpm', '.gz']
 
+CACHE_INFO_FILE_NAME = 'info.json'
+CACHE_BIN_FILE_NAME = 'file.bin'
 
-def need_file_to_parallel(path: str) -> bool:
-    pr = urlparse(path)  # type: ParseResult
-    path, ext = os.path.splitext(pr.path)
+
+def need_file_to_parallel(url: str) -> bool:
+    pr = urlparse(url)  # type: ParseResult
+    url, ext = os.path.splitext(pr.path)
     return ext.lower() in files_to_parallel
 
 
@@ -129,10 +135,14 @@ def get_bytes_ranges_by_part_size(length: int, part_size: int) -> List[Tuple[int
     return bytes_ranges
 
 
+def get_unique_name():
+    return str(time()).replace('.', '_')
+
+
 class RangeDownloader:
     def __init__(
             self,
-            path: str,
+            url: str,
             bytes_range: Tuple[int, int],
             buffer_file_path,
             *,
@@ -140,7 +150,7 @@ class RangeDownloader:
             server_logger=server_logger,
             chunk_size=DEFAULT_CHUNK_SIZE,
             chunk_download_timeout=DEFAULT_CHUNK_DOWNLOAD_TIMEOUT):
-        self._path = path
+        self._url = url
         self._bytes_range = bytes_range
         self._length = bytes_range[1] - bytes_range[0] + 1
         self._buffer_file_path = buffer_file_path
@@ -175,7 +185,7 @@ class RangeDownloader:
             # Create client session for downloading a file part from a host.
             async with aiohttp.ClientSession(loop=self._loop, headers=self._headers) as session:
                 # Request a host for a file part.
-                async with session.request('GET', self._path) as res:  # type: aiohttp.ClientResponse
+                async with session.request('GET', self._url) as res:  # type: aiohttp.ClientResponse
                     if res.status != 206:
                         raise WrongResponseError('Expected status code 206, but {!s} ({!s}) received.',
                                                  res.status,
@@ -251,13 +261,21 @@ class RangeDownloader:
         self._server_logger.debug(msg, *args, **kwargs)
 
     def __repr__(self, *args, **kwargs):
-        return '<RangeDownloader ({2!s}): [{0[0]!s}-{0[1]!s}] {1!r}>'.format(self._bytes_range, self._path, self._state)
+        return '<RangeDownloader ({2!s}): [{0[0]!s}-{0[1]!s}] {1!r}>'.format(self._bytes_range, self._url, self._state)
 
 
 class ParallelDownloader:
+    """Parallel downloader"""
+
+    _state = NOT_STARTED
+    _downloaders = []  # type: List[RangeDownloader]
+    _downloads = set()  # type: Set[Future]
+    _filename = None  # type: str
+    _next_id = 0
+
     def __init__(
             self,
-            path: str,
+            url: str,
             file_length: int,
             *,
             parallels: int = DEFAULT_PARALLELS,
@@ -268,18 +286,15 @@ class ParallelDownloader:
             buffer_dir: str = DEFAULT_BUFFER_DIR):
         assert parallels > 1
 
-        self._path = path
+        self._url = url
         self._file_length = file_length
         self._part_size = part_size
         self._parallels = parallels
         self._chunk_size = chunk_size
         self._loop = loop if loop is not None else asyncio.get_event_loop()
         self._server_logger = server_logger
-        self._filename = None  # type: str
-        self._download_dir = os.path.join(buffer_dir, str(self._loop.time()).replace('.', '_'))
-        self._downloaders = []  # type: List[RangeDownloader]
-        self._downloads = set()  # type: Set[Future]
-        self._state = NOT_STARTED
+        self._download_dir = os.path.join(buffer_dir, get_unique_name())
+
         self._create_download_dir()
 
         # Calculate bytes ranges.
@@ -289,9 +304,6 @@ class ParallelDownloader:
         if self._parts < self._parallels:
             self._bytes_ranges = get_bytes_ranges_by_parts(self._file_length, self._parallels)
             self._parts = len(self._bytes_ranges)
-
-        # Next index of a downloader.
-        self._next_id = 0
 
         self._state_condition = asyncio.Condition(loop=self._loop)
 
@@ -304,7 +316,8 @@ class ParallelDownloader:
         return self._downloaders
 
     async def download(self):
-        assert self._state == NOT_STARTED
+        if self._state == DOWNLOADING:
+            return
         self._state = DOWNLOADING
 
         # Create a downloader for each bytes range.
@@ -312,27 +325,26 @@ class ParallelDownloader:
             filename = '{idx:03}_{range[0]!s}-{range[1]!s}.tmp'.format(idx=i, range=bytes_range)
             buffer_file_path = os.path.join(self._download_dir, filename)
             self._downloaders.append(
-                RangeDownloader(self._path,
+                RangeDownloader(self._url,
                                 bytes_range,
                                 buffer_file_path,
                                 loop=self._loop,
                                 chunk_size=self._chunk_size))
 
-        # Start parallel downloaders for first parts.
-        for _ in range(0, self._parallels):
-            self._start_next_downloader()
+        # Start first single downloader for fast first part response to a client.
+        self._start_next_downloaders(1)
 
         # Waiting for all downloads to complete.
         try:
             while self._state is DOWNLOADING and self._downloads:
-                done, self._downloads = await asyncio.wait(self._downloads, loop=self._loop,
-                                                           return_when=asyncio.FIRST_COMPLETED)
+                done, self._downloads = await wait(self._downloads, loop=self._loop,
+                                                   return_when=asyncio.FIRST_COMPLETED)
                 for dd in done:  # type: Future
                     # Cancel downloading if any of completed downloads is not downloaded.
                     if dd.result() is not DOWNLOADED:
                         raise CancelledError()
-                    # Start next downloader if any.
-                    self._start_next_downloader()
+
+                self._start_next_downloaders()
 
                 # Notify all readers.
                 async with self._state_condition:
@@ -346,42 +358,38 @@ class ParallelDownloader:
             async with self._state_condition:
                 self._state_condition.notify_all()
 
-            raise
+            raise DownloadError(ex)
         else:
             # OK. All done.
             self._state = DOWNLOADED
 
-    def _start_next_downloader(self):
-        if self._next_id >= self._parts:
-            return
-        downloader = self._downloaders[self._next_id]
-        self._next_id += 1
-        self._downloads.add(asyncio.ensure_future(downloader.download(), loop=self._loop))
+    def _start_next_downloaders(self, n=None):
+        """Start next downloaders if needed according with parallels count."""
+        if not n:
+            n = self._parallels - len(self._downloads)
+        while n > 0 and self._next_id < self._parts:
+            downloader = self._downloaders[self._next_id]
+            self._next_id += 1
+            self._downloads.add(ensure_future(downloader.download(), loop=self._loop))
+            n -= 1
 
-    async def read(self, callback: Callable[[bytearray], None]):
-        chunk = bytearray(self._chunk_size)
-        chunk_size = len(chunk)
+    async def read(self, callback: Callable[[bytearray], Any]):
+        try:
+            for downloader in self._downloaders:
 
-        for downloader in self._downloaders:
+                # Wait until downloader is not in a downloaded/cancelled state.
+                async with self._state_condition:
+                    while downloader.state not in (DOWNLOADED, CANCELLED):
+                        await self._state_condition.wait()
+                    if downloader.state != DOWNLOADED:
+                        self._debug('Downloader not in `DOWNLOADED` state, but in `{!s}`.'.format(downloader.state))
+                        raise CancelledError()
 
-            # Wait until downloader is not in a downloaded/cancelled state.
-            async with self._state_condition:
-                while downloader.state not in (DOWNLOADED, CANCELLED):
-                    await self._state_condition.wait()
-                if downloader.state != DOWNLOADED:
-                    self._debug('Downloader not in `DOWNLOADED` state, but in `{!s}`.'.format(downloader.state))
-                    raise CancelledError()
-
-            # Open file and send all its bytes it to back.
-            with open(downloader.buffer_file_path, 'rb') as file:
-                while self._state != CANCELLED:
-                    r = await self._run_nonblocking(lambda: file.readinto(chunk))
-                    if not r:
-                        break
-                    if r < chunk_size:
-                        callback(memoryview(chunk)[:r].tobytes())
-                    else:
-                        callback(chunk)
+                # Open file and send all its bytes it to back.
+                await read_from_file_by_chunks(downloader.buffer_file_path, callback, self._chunk_size,
+                                               lambda: self._state != CANCELLED, loop=self._loop)
+        except Exception as exc:
+            raise ReadError(exc)
 
     def cancel(self):
         if self._state != DOWNLOADING:
@@ -396,6 +404,7 @@ class ParallelDownloader:
         await self._clear()
 
     async def _clear(self):
+        self._downloaders.clear()
         await self._run_nonblocking(lambda: shutil.rmtree(self._download_dir, ignore_errors=True))
 
     async def _run_nonblocking(self, func):
@@ -410,7 +419,235 @@ class ParallelDownloader:
         self._server_logger.debug(msg, *args, **kwargs)
 
     def __repr__(self, *args, **kwargs):
-        return '<ParallelDownloader: {!r}>'.format(self._path)
+        return '<ParallelDownloader: {!r}>'.format(self._url)
+
+
+CacheFileInfo = namedtuple('CacheFileInfo', ['url', 'length', 'last_modified', 'etag'])
+
+INITIALIZING = 'INITIALIZING'
+READY = 'READY'
+
+
+def get_cache_bin_file_path(cache_entry_dir: str):
+    return os.path.join(cache_entry_dir, CACHE_BIN_FILE_NAME)
+
+
+def get_cache_info_file_path(cache_entry_dir: str):
+    return os.path.join(cache_entry_dir, CACHE_INFO_FILE_NAME)
+
+
+def create_new_cache_entry_dir(cache_dir: str):
+    cache_entry_dir = os.path.join(cache_dir, get_unique_name())
+    os.makedirs(cache_entry_dir, exist_ok=True)
+    return cache_entry_dir
+
+
+async def read_from_file_by_chunks(
+        file_path: str,
+        callback: Callable[[bytearray], None],
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
+        condition=lambda: True,
+        *,
+        loop):
+    chunk = bytearray(chunk_size)
+    with open(file_path, 'rb') as f:
+        while condition():
+            r = await loop.run_in_executor(None, lambda: f.readinto(chunk))
+            if not r:
+                break
+            if r < chunk_size:
+                callback(memoryview(chunk)[:r].tobytes())
+            else:
+                callback(chunk)
+
+
+class CachingDownloader:
+    """Downloader with caching."""
+
+    _state = INITIALIZING
+
+    _downloadings = {}  # type: Dict[str, Tuple[ParallelDownloader, Future, Future]]
+    _uploadings = set()  # type: Set[(str, Future)]
+    _cache = {}  # type: Dict[str, str]
+
+    def __init__(self,
+                 cache_dir: str,
+                 parallels,
+                 part_size,
+                 chunk_size,
+                 loop,
+                 server_logger=server_logger):
+        self._cache_dir = cache_dir
+        self._parallels = parallels
+        self._part_size = part_size
+        self._chunk_size = chunk_size
+        self._loop = loop if loop is not None else asyncio.get_event_loop()
+        self._server_logger = server_logger
+        self._state_condition = asyncio.Condition(loop=self._loop)
+
+        ensure_future(self._init_cache(), loop=self._loop)
+
+    async def download(self, url: str, head: CIMultiDictProxy, callback: Callable[[bytearray], None]) -> str:
+        content_length = head.get(hdrs.CONTENT_LENGTH)
+        assert content_length is not None
+        content_length = int(content_length)
+
+        await self._when_state(READY)
+
+        if not await self._upload_from_cache(url, callback):
+            await self._upload_with_pd(url, content_length, callback)
+
+    async def _upload_from_cache(self, url: str, callback: Callable[[bytearray], None]) -> bool:
+        """Upload from cache"""
+        cache_entry_dir = self._cache.get(url)
+        if not cache_entry_dir:
+            return False
+
+        self._debug('Uploading (from cache): {!r}.'.format(url))
+
+        cache_info = await self._load_cache_info(cache_entry_dir)
+        # TODO: check cache entry is out of date.
+        cache_bin_file_path = get_cache_bin_file_path(cache_entry_dir)
+
+        # Open file and send all its bytes it to back.
+        coro_read = read_from_file_by_chunks(cache_bin_file_path, callback, self._chunk_size,
+                                             lambda: self._state != CANCELLED, loop=self._loop)
+        uploading = ensure_future(coro_read, loop=self._loop)
+
+        self._uploadings.add((url, uploading))
+
+        try:
+            await uploading
+        except ReadError:
+            self._debug('Read error.')
+            pass
+        except Exception as exc:
+            self._debug('Uploading failed with exception: {!r}.'.format(exc))
+            raise
+        finally:
+            self._uploadings.remove((url, uploading))
+        return True
+
+    async def _upload_with_pd(self, url, content_length, callback: Callable[[bytearray], None]):
+        """Upload using parallel downloader."""
+
+        self._debug('Uploading (from parallel downloader): {!r}.'.format(url))
+
+        # Start or join existed downloading task.
+        dl = self._downloadings.get(url)
+        if dl:
+            pd, downloading, caching = dl
+        else:
+            def downloading_done(_):
+                self._debug('Downloading {!r} done.'.format(url))
+                assert url in self._downloadings
+                del self._downloadings[url]
+
+            # Create parallel downloader.
+            pd = ParallelDownloader(url, content_length,
+                                    parallels=self._parallels,
+                                    part_size=self._part_size,
+                                    chunk_size=self._chunk_size,
+                                    loop=self._loop)
+
+            # Start downloading.
+            downloading = ensure_future(pd.download(), loop=self._loop)
+            downloading.add_done_callback(downloading_done)
+
+            # Write downloading content to a cache entry.
+            cache_entry_dir = create_new_cache_entry_dir(self._cache_dir)
+
+            async def cache():
+                try:
+                    cache_bin_file_path = get_cache_bin_file_path(cache_entry_dir)
+                    with open(cache_bin_file_path, 'xb') as cache_bin_file:
+                        await pd.read(lambda chunk: cache_bin_file.write(chunk))
+
+                    cache_info = {'url': url, 'content-length': content_length}
+                    await self._save_cache_info(cache_entry_dir, cache_info)
+
+                    # Add to a cache index.
+                    self._cache[url] = cache_entry_dir
+                except:
+                    # Remove cache entry dir in case of error or cancellation.
+                    shutil.rmtree(cache_entry_dir)
+                    raise
+
+            caching = ensure_future(cache(), loop=self._loop)
+            self._downloadings[url] = pd, downloading, caching
+
+        uploading = ensure_future(pd.read(callback), loop=self._loop)
+        self._uploadings.add((url, uploading))
+
+        try:
+            await uploading
+        except ReadError:
+            self._debug('Read error.')
+            pass
+        except Exception as exc:
+            self._debug('Uploading failed with exception: {!r}.'.format(exc))
+            raise
+        finally:
+            self._uploadings.remove((url, uploading))
+            if not self._uploadings:
+                await pd.clear()
+
+    async def _save_cache_info(self, cache_entry_dir: str, cache_info: Dict[str, str]):
+        def do():
+            cache_info_file_path = get_cache_info_file_path(cache_entry_dir)
+            with open(cache_info_file_path, 'w') as f:
+                json.dump(cache_info, f)
+
+        await self._run_nb(do)
+
+    async def _load_cache_info(self, cache_entry_dir: str) -> Dict[str, str]:
+        def do():
+            cache_info_file_path = get_cache_info_file_path(cache_entry_dir)
+            if not os.path.isfile(cache_info_file_path):
+                raise CacheError('Cache info file problem.')
+            with open(cache_info_file_path) as f:
+                return json.load(f)  # type: Dict
+
+        return await self._run_nb(do)
+
+    async def _init_cache(self):
+        for cache_entry_dir in os.listdir(self._cache_dir):
+            cache_entry_dir = os.path.join(self._cache_dir, cache_entry_dir)
+            if not os.path.isdir(cache_entry_dir):
+                continue
+            try:
+                cache_bin_file_path = get_cache_bin_file_path(cache_entry_dir)
+                if not os.path.isfile(cache_bin_file_path):
+                    raise CacheError('Cache bin file problem.')
+
+                cache_info = await self._load_cache_info(cache_entry_dir)
+                url = cache_info.get('url')
+                if not url:
+                    raise CacheError('Bad cache info file.')
+
+                self._cache[url] = cache_entry_dir
+            except Exception as exc:
+                self._debug('Cannot load cache from dir: {!r}. Error: {!r}.'.format(cache_entry_dir, exc))
+                continue
+
+        async with self._state_condition:
+            self._state = READY
+            self._state_condition.notify_all()
+
+    async def _when_state(self, state):
+        async with self._state_condition:
+            while self._state is not state:
+                await self._state_condition.wait()
+
+    async def _run_nb(self, func):
+        return await self._loop.run_in_executor(None, lambda: func())
+
+    def _debug(self, msg, *args, **kwargs):
+        msg = "{!r} {!s}".format(self, msg)
+        self._server_logger.debug(msg, *args, **kwargs)
+
+    def __repr__(self, *args, **kwargs):
+        return '<CachingDownloader (D:{!s} U:{!s})>'.format(len(self._downloadings), len(self._uploadings))
 
 
 class ParallelHttpRequestHandler(aiohttp.server.ServerHttpProtocol):
@@ -427,6 +664,8 @@ class ParallelHttpRequestHandler(aiohttp.server.ServerHttpProtocol):
             parallels: int = DEFAULT_PARALLELS,
             part_size: int = DEFAULT_PART_SIZE,
             chunk_size: int = DEFAULT_CHUNK_SIZE,
+            buffer_dir: str = DEFAULT_BUFFER_DIR,
+            cached_downloader: CachingDownloader,
             **kwargs):
         super().__init__(
             loop=loop,
@@ -445,6 +684,8 @@ class ParallelHttpRequestHandler(aiohttp.server.ServerHttpProtocol):
         self._parallels = parallels
         self._part_size = part_size
         self._chunk_size = chunk_size
+        self._buffer_dir = buffer_dir
+        self._cached_downloader = cached_downloader
 
     def connection_made(self, transport):
         super().connection_made(transport)
@@ -550,39 +791,24 @@ class ParallelHttpRequestHandler(aiohttp.server.ServerHttpProtocol):
         client_res.add_header(PARALLELS_HEADER, str(self._parallels))
         client_res.send_headers()
 
-        pd = ParallelDownloader(message.path, content_length,
-                                parallels=self._parallels,
-                                part_size=self._part_size,
-                                chunk_size=self._chunk_size,
-                                loop=self._loop)
         try:
-            downloading = asyncio.ensure_future(pd.download(), loop=self._loop)
-            uploading = asyncio.ensure_future(pd.read(lambda chunk: client_res.write(chunk)), loop=self._loop)
-            await asyncio.wait([downloading, uploading], loop=self._loop,
-                               return_when=asyncio.FIRST_EXCEPTION)
-            if downloading.exception():
-                raise CancelledError('Downloading failed with error: {!r}.'.format(downloading.exception()))
-            if uploading.exception():
-                raise CancelledError('Uploading failed with error: {!r}.'.format(downloading.exception()))
-
+            await self._cached_downloader.download(message.path, head, lambda chunk: client_res.write(chunk))
             await client_res.write_eof()
         except Exception as exc:
-            pd.cancel()
             self.log_debug("CANCELLED PARALLEL GET {!r}. Caused by exception: {!r}.".format(message.path, exc))
             raise
-        finally:
-            await pd.clear()
 
         return client_res
 
-    async def get_file_head(self, path: str) -> Optional[CIMultiDictProxy]:
+    async def get_file_head(self, url: str) -> Optional[CIMultiDictProxy]:
         """Make a HEAD request to get a 'content-length' and 'accept-ranges' headers."""
+        self.log_debug('Getting a HEAD for url: {!s}.'.format(url))
         try:
             async with aiohttp.ClientSession(loop=self._loop) as session:
-                async with session.request(hdrs.METH_HEAD, path) as res:  # type: aiohttp.ClientResponse
+                async with session.request(hdrs.METH_HEAD, url) as res:  # type: aiohttp.ClientResponse
                     return res.headers
-        except (aiohttp.ServerDisconnectedError, aiohttp.ClientResponseError):
-            self.log_debug("Could not get a HEAD for the {!r}.".format(path))
+        except Exception as exc:
+            self.log_debug("Could not get a HEAD for the {!r}. Error: {!r}.".format(url, exc))
         return None
 
     def get_client_address(self):
@@ -619,7 +845,7 @@ class ParallelHttpRequestHandlerFactory:
     async def _connections_cleanup(self):
         sleep = 0.05
         while self._connections:
-            await asyncio.sleep(sleep, loop=self._loop)
+            await sleep(sleep, loop=self._loop)
             if sleep < 5:
                 sleep *= 2
 
@@ -634,9 +860,9 @@ class ParallelHttpRequestHandlerFactory:
 
         if timeout:
             try:
-                await asyncio.wait_for(
+                await wait_for(
                     self._connections_cleanup(), timeout, loop=self._loop)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 self._server_logger.warning(
                     "Not all connections are closed (pending: %d)",
                     len(self._connections))
@@ -672,9 +898,26 @@ class UnsupportedError(ParaproxioError):
     pass
 
 
+class DownloadError(ParaproxioError):
+    pass
+
+
+class ReadError(ParaproxioError):
+    pass
+
+
+class CacheError(ParaproxioError):
+    pass
+
+
 def setup_dirs(*dirs):
     for d in dirs:
         os.makedirs(d, exist_ok=True)
+
+
+def clean_dirs(*dirs):
+    for d in dirs:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def get_args(args):
@@ -687,10 +930,18 @@ def get_args(args):
     parser.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS, help="max workers of executor")
     parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE, help="chunk size")
     parser.add_argument("--buffer-dir", type=str, default=DEFAULT_BUFFER_DIR, help="buffer dir")
+    parser.add_argument("--cache-dir", type=str, default=DEFAULT_CACHE_DIR, help="cache dir")
     parser.add_argument("--logs-dir", type=str, default=DEFAULT_LOGS_DIR, help="logs dir")
     parser.add_argument("--debug", default=False, action="store_true", help="enable debug information in the stdout")
+    parser.add_argument("--clean-all", default=False, action="store_true", help="clean all temp files before start")
     parser.add_argument("--version", action="version", version=PARAPROXIO_VERSION)
-    return parser.parse_args(args)
+    pargs = parser.parse_args(args)
+
+    pargs.buffer_dir = os.path.abspath(pargs.buffer_dir)
+    pargs.cache_dir = os.path.abspath(pargs.cache_dir)
+    pargs.logs_dir = os.path.abspath(pargs.logs_dir)
+
+    return pargs
 
 
 class Paraproxio:
@@ -699,7 +950,12 @@ class Paraproxio:
         self._loop = loop
         self._enable_logging = enable_logging
 
-        setup_dirs(self._args.buffer_dir, self._args.logs_dir)
+        clean_dirs(self._args.buffer_dir)
+
+        if self._args.clean_all:
+            clean_dirs(self._args.logs_dir, self._args.cache_dir)
+
+        setup_dirs(self._args.buffer_dir, self._args.logs_dir, self._args.cache_dir)
 
         # Create an event loop.
         self._autoclose_loop = False
@@ -717,11 +973,19 @@ class Paraproxio:
                                 DEFAULT_ACCESS_LOG_FILENAME,
                                 debug=self._args.debug)
 
+        self._cached_downloader = CachingDownloader(cache_dir=self._args.cache_dir,
+                                                    parallels=self._args.parallels,
+                                                    part_size=self._args.part_size,
+                                                    chunk_size=self._args.chunk_size,
+                                                    loop=self._loop)
+
     def run_forever(self):
         handler_factory = ParallelHttpRequestHandlerFactory(loop=self._loop, debug=self._args.debug,
                                                             parallels=self._args.parallels,
                                                             part_size=self._args.part_size,
                                                             chunk_size=self._args.chunk_size,
+                                                            buffer_dir=self._args.buffer_dir,
+                                                            cached_downloader=self._cached_downloader,
                                                             keep_alive=75)
 
         srv = self._loop.run_until_complete(self._loop.create_server(handler_factory, self._args.host, self._args.port))

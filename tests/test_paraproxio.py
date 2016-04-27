@@ -260,7 +260,8 @@ class TestParaproxio(unittest.TestCase):
             args=['--host', PROXY_SERVER_HOST,
                   '--port', str(PROXY_SERVER_PORT),
                   '--parallels', self.parallels,
-                  '--debug'])
+                  '--debug',
+                  '--clean-all'])
 
     def tearDown(self):
         self.proxy_server.stop()
@@ -275,12 +276,13 @@ class TestParaproxio(unittest.TestCase):
             url = create_host_url(file_path)
             async with session.get(url) as resp:  # type: ClientResponse
                 self.assertEqual(resp.status, 200)
-                self.assertEqual(resp.headers.get(hdrs.CONTENT_LENGTH), str(expected_content_length))
+                if resp.headers.get(hdrs.TRANSFER_ENCODING) != 'chunked':
+                    self.assertEqual(resp.headers.get(hdrs.CONTENT_LENGTH), str(expected_content_length))
                 content = await resp.read()
                 self.assertEqual(content, expected_content)
                 if check_resp:
                     check_resp(resp)
-                time.sleep(1)  # Wait a little bit before closing the session.
+                await asyncio.sleep(1, loop=self.loop)  # Wait a little bit before closing the session.
 
     def test_normal_get(self):
         def check_resp(resp: aiohttp.ClientResponse):
