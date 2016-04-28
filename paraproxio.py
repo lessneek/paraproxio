@@ -38,7 +38,7 @@ import concurrent.futures
 from collections import namedtuple
 import json
 from time import time
-
+import threading
 from asyncio import AbstractEventLoop, Future, ensure_future, wait, wait_for, TimeoutError
 from asyncio.futures import CancelledError
 from typing import Tuple, Callable, Optional, List, Set, Dict, Any
@@ -91,6 +91,9 @@ files_to_parallel = ['.iso', '.zip', '.rpm', '.gz']
 
 CACHE_INFO_FILE_NAME = 'info.json'
 CACHE_BIN_FILE_NAME = 'file.bin'
+CACHE_LAST_ACCESS_FILE_NAME = 'last-access'
+DEFAULT_CACHE_MAX_AGE = 60 * 60 * 24 * 3  # 3 days in seconds
+DEFAULT_CACHE_CLEANUP_INTERVAL = 60 * 10  # clean-up every 10 minutes
 
 
 def need_file_to_parallel(url: str) -> bool:
@@ -436,6 +439,10 @@ def get_cache_info_file_path(cache_entry_dir: str):
     return os.path.join(cache_entry_dir, CACHE_INFO_FILE_NAME)
 
 
+def get_cache_last_access_file_path(cache_entry_dir: str):
+    return os.path.join(cache_entry_dir, CACHE_LAST_ACCESS_FILE_NAME)
+
+
 def create_new_cache_entry_dir(cache_dir: str):
     cache_entry_dir = os.path.join(cache_dir, get_unique_name())
     os.makedirs(cache_entry_dir, exist_ok=True)
@@ -470,6 +477,8 @@ class CachingDownloader:
     _uploadings = set()  # type: Set[(str, Future)]
     _cache = {}  # type: Dict[str, str]
 
+    _last_access_file_lock = threading.Lock()
+
     def __init__(self,
                  cache_dir: str,
                  parallels,
@@ -499,7 +508,12 @@ class CachingDownloader:
         if not cache_entry_dir:
             return False
 
-        cache_info = await self._load_cache_info(cache_entry_dir)
+        try:
+            cache_info = await self._load_cache_info(cache_entry_dir)
+        except CacheError as exc:
+            self._debug('Bad cache entry deleted: {!r}. Error: {!r}.'.format(cache_entry_dir, exc))
+            self._delete_cache_entry(cache_entry_dir)
+            return False
 
         up_to_date = head.get(hdrs.LAST_MODIFIED) == cache_info.get(hdrs.LAST_MODIFIED)
         up_to_date &= head.get(hdrs.ETAG) == cache_info.get(hdrs.ETAG)
@@ -510,6 +524,8 @@ class CachingDownloader:
             return False
 
         self._debug('Uploading (from cache): {!r}.'.format(url))
+
+        await self._update_last_access(cache_entry_dir)
 
         cache_bin_file_path = get_cache_bin_file_path(cache_entry_dir)
 
@@ -563,13 +579,15 @@ class CachingDownloader:
             downloading.add_done_callback(downloading_done)
 
             # Write downloading content to a cache entry.
-            cache_entry_dir = create_new_cache_entry_dir(self._cache_dir)
-
             async def cache():
+                cache_entry_dir = create_new_cache_entry_dir(self._cache_dir)
                 try:
                     cache_bin_file_path = get_cache_bin_file_path(cache_entry_dir)
+
                     with open(cache_bin_file_path, 'xb') as cache_bin_file:
                         await pd.read(lambda chunk: cache_bin_file.write(chunk))
+
+                    await self._update_last_access(cache_entry_dir)
 
                     cache_info = {
                         'URL': url,
@@ -618,10 +636,21 @@ class CachingDownloader:
             cache_info_file_path = get_cache_info_file_path(cache_entry_dir)
             if not os.path.isfile(cache_info_file_path):
                 raise CacheError('Cache info file problem.')
-            with open(cache_info_file_path) as f:
-                return json.load(f)  # type: Dict
+            try:
+                with open(cache_info_file_path) as f:
+                    return json.load(f)  # type: Dict
+            except Exception as exc:
+                raise CacheError(exc)
 
         return await self._run_nb(do)
+
+    async def _update_last_access(self, cache_entry_dir: str):
+        def do():
+            cache_last_access_file_path = get_cache_last_access_file_path(cache_entry_dir)
+            with self._last_access_file_lock, open(cache_last_access_file_path, 'w') as f:
+                f.write(str(time()))
+
+        await self._run_nb(do)
 
     async def _init_cache(self):
         for cache_entry_dir in os.listdir(self._cache_dir):
@@ -648,7 +677,10 @@ class CachingDownloader:
             self._state_condition.notify_all()
 
     async def _delete_cache_entry(self, cache_entry_dir):
-        await self._run_nb(lambda: shutil.rmtree(cache_entry_dir))
+        try:
+            await self._run_nb(lambda: shutil.rmtree(cache_entry_dir))
+        except:
+            pass
 
     async def _when_state(self, state):
         async with self._state_condition:
@@ -948,6 +980,7 @@ def get_args(args):
     parser.add_argument("--buffer-dir", type=str, default=DEFAULT_BUFFER_DIR, help="buffer dir")
     parser.add_argument("--cache-dir", type=str, default=DEFAULT_CACHE_DIR, help="cache dir")
     parser.add_argument("--logs-dir", type=str, default=DEFAULT_LOGS_DIR, help="logs dir")
+    parser.add_argument("--cache-max-age", type=int, default=DEFAULT_CACHE_MAX_AGE, help="max age of a cache entry")
     parser.add_argument("--debug", default=False, action="store_true", help="enable debug information in the stdout")
     parser.add_argument("--clean-all", default=False, action="store_true", help="clean all temp files before start")
     parser.add_argument("--version", action="version", version=PARAPROXIO_VERSION)
@@ -958,6 +991,25 @@ def get_args(args):
     pargs.logs_dir = os.path.abspath(pargs.logs_dir)
 
     return pargs
+
+
+class PeriodicTask(object):
+    _handler = None
+
+    def __init__(self, action: Callable[[], None], interval: int, *, loop):
+        self._action = action
+        self._interval = interval
+        self._loop = loop
+
+    def _run(self):
+        self._action()
+        self.start()
+
+    def start(self):
+        self._handler = self._loop.call_later(self._interval, self._run)
+
+    def stop(self):
+        self._handler.cancel()
 
 
 class Paraproxio:
@@ -996,6 +1048,9 @@ class Paraproxio:
                                                     loop=self._loop)
 
     def run_forever(self):
+        cache_cleaner = PeriodicTask(self._clean_old_cache_entries, DEFAULT_CACHE_CLEANUP_INTERVAL, loop=self._loop)
+        cache_cleaner.start()
+
         handler_factory = ParallelHttpRequestHandlerFactory(loop=self._loop, debug=self._args.debug,
                                                             parallels=self._args.parallels,
                                                             part_size=self._args.part_size,
@@ -1013,6 +1068,7 @@ class Paraproxio:
         except KeyboardInterrupt:
             pass
         finally:
+            cache_cleaner.stop()
             srv.close()
             self._loop.run_until_complete(srv.wait_closed())
             self._loop.run_until_complete(handler_factory.finish_connections(timeout=15))
@@ -1022,6 +1078,27 @@ class Paraproxio:
 
         if self._enable_logging:
             self._release_logging()
+
+    def _clean_old_cache_entries(self):
+        cache_dir = self._args.cache_dir
+        max_age = self._args.cache_max_age
+        for cache_entry_dir in os.listdir(cache_dir):
+            cache_entry_dir = os.path.join(cache_dir, cache_entry_dir)
+            if not os.path.isdir(cache_entry_dir):
+                continue
+            try:
+                cache_last_access_file_path = get_cache_last_access_file_path(cache_entry_dir)
+                if not os.path.isfile(cache_last_access_file_path):
+                    raise CacheError('Cache bin file problem.')
+
+                with open(cache_last_access_file_path) as f:
+                    last_access = float(f.read())
+
+                if time() - last_access > max_age:
+                    shutil.rmtree(cache_entry_dir)
+
+            except:
+                continue
 
     def _setup_logging(
             self,
