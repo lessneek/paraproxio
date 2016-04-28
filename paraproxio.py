@@ -488,25 +488,29 @@ class CachingDownloader:
         ensure_future(self._init_cache(), loop=self._loop)
 
     async def download(self, url: str, head: CIMultiDictProxy, callback: Callable[[bytearray], None]) -> str:
-        content_length = head.get(hdrs.CONTENT_LENGTH)
-        assert content_length is not None
-        content_length = int(content_length)
-
         await self._when_state(READY)
 
-        if not await self._upload_from_cache(url, callback):
-            await self._upload_with_pd(url, content_length, callback)
+        if not await self._upload_from_cache(url, head, callback):
+            await self._upload_with_pd(url, head, callback)
 
-    async def _upload_from_cache(self, url: str, callback: Callable[[bytearray], None]) -> bool:
+    async def _upload_from_cache(self, url: str, head: CIMultiDictProxy, callback: Callable[[bytearray], None]) -> bool:
         """Upload from cache"""
         cache_entry_dir = self._cache.get(url)
         if not cache_entry_dir:
             return False
 
+        cache_info = await self._load_cache_info(cache_entry_dir)
+
+        up_to_date = head.get(hdrs.LAST_MODIFIED) == cache_info.get(hdrs.LAST_MODIFIED)
+        up_to_date &= head.get(hdrs.ETAG) == cache_info.get(hdrs.ETAG)
+
+        if not up_to_date:
+            self._debug('Outdated cache for: {!r} deleted.'.format(url))
+            await self._delete_cache_entry(cache_entry_dir)
+            return False
+
         self._debug('Uploading (from cache): {!r}.'.format(url))
 
-        cache_info = await self._load_cache_info(cache_entry_dir)
-        # TODO: check cache entry is out of date.
         cache_bin_file_path = get_cache_bin_file_path(cache_entry_dir)
 
         # Open file and send all its bytes it to back.
@@ -528,8 +532,12 @@ class CachingDownloader:
             self._uploadings.remove((url, uploading))
         return True
 
-    async def _upload_with_pd(self, url, content_length, callback: Callable[[bytearray], None]):
+    async def _upload_with_pd(self, url, head: CIMultiDictProxy, callback: Callable[[bytearray], None]):
         """Upload using parallel downloader."""
+
+        content_length = head.get(hdrs.CONTENT_LENGTH)
+        assert content_length is not None
+        content_length = int(content_length)
 
         self._debug('Uploading (from parallel downloader): {!r}.'.format(url))
 
@@ -563,14 +571,19 @@ class CachingDownloader:
                     with open(cache_bin_file_path, 'xb') as cache_bin_file:
                         await pd.read(lambda chunk: cache_bin_file.write(chunk))
 
-                    cache_info = {'url': url, 'content-length': content_length}
+                    cache_info = {
+                        'URL': url,
+                        hdrs.CONTENT_LENGTH: content_length,
+                        hdrs.LAST_MODIFIED: head.get(hdrs.LAST_MODIFIED),
+                        hdrs.ETAG: head.get(hdrs.ETAG)
+                    }
                     await self._save_cache_info(cache_entry_dir, cache_info)
 
                     # Add to a cache index.
                     self._cache[url] = cache_entry_dir
                 except:
                     # Remove cache entry dir in case of error or cancellation.
-                    shutil.rmtree(cache_entry_dir)
+                    await self._delete_cache_entry(cache_entry_dir)
                     raise
 
             caching = ensure_future(cache(), loop=self._loop)
@@ -596,7 +609,7 @@ class CachingDownloader:
         def do():
             cache_info_file_path = get_cache_info_file_path(cache_entry_dir)
             with open(cache_info_file_path, 'w') as f:
-                json.dump(cache_info, f)
+                json.dump(cache_info, f, indent=4)
 
         await self._run_nb(do)
 
@@ -621,7 +634,7 @@ class CachingDownloader:
                     raise CacheError('Cache bin file problem.')
 
                 cache_info = await self._load_cache_info(cache_entry_dir)
-                url = cache_info.get('url')
+                url = cache_info.get('URL')
                 if not url:
                     raise CacheError('Bad cache info file.')
 
@@ -633,6 +646,9 @@ class CachingDownloader:
         async with self._state_condition:
             self._state = READY
             self._state_condition.notify_all()
+
+    async def _delete_cache_entry(self, cache_entry_dir):
+        await self._run_nb(lambda: shutil.rmtree(cache_entry_dir))
 
     async def _when_state(self, state):
         async with self._state_condition:
