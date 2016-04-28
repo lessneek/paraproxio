@@ -446,7 +446,7 @@ async def read_from_file_by_chunks(
         file_path: str,
         callback: Callable[[bytearray], None],
         chunk_size: int = DEFAULT_CHUNK_SIZE,
-        condition=lambda: True,
+        condition: Callable[[], bool] = lambda: True,
         *,
         loop):
     chunk = bytearray(chunk_size)
