@@ -36,12 +36,17 @@ import shutil
 import argparse
 import concurrent.futures
 import json
-from time import time
+import traceback
+import socket
+import http.server
 import threading
+from time import time
 from asyncio import AbstractEventLoop, Future, ensure_future, wait, wait_for, TimeoutError
 from asyncio.futures import CancelledError
 from typing import Tuple, Callable, Optional, List, Set, Dict, Any
 from urllib.parse import urlparse, ParseResult
+from math import ceil
+from html import escape as html_escape
 
 try:
     import aiohttp
@@ -55,6 +60,28 @@ except ImportError as err:
         "Required module '{0}' not found. Try to run 'pip install {0}' to install it.".format(err.name),
         file=sys.stderr)
     exit(1)
+
+if hasattr(socket, 'SO_KEEPALIVE'):
+    def tcp_keepalive(server, transport):
+        sock = transport.get_extra_info('socket')
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+else:
+    def tcp_keepalive(server, transport):  # pragma: no cover
+        pass
+
+DEFAULT_ERROR_MESSAGE = """
+<html>
+  <head>
+    <title>{status} {reason}</title>
+  </head>
+  <body>
+    <h1>{status} {reason}</h1>
+    {message}
+  </body>
+</html>"""
+
+EMPTY_PAYLOAD = aiohttp.streams.EmptyStreamReader()
+RESPONSES = http.server.BaseHTTPRequestHandler.responses
 
 DEFAULT_HOST = '127.0.0.1'
 DEFAULT_PORT = 8880
@@ -695,7 +722,17 @@ class CachingDownloader:
         return '<CachingDownloader (D:{!s} U:{!s})>'.format(len(self._downloadings), len(self._uploadings))
 
 
-class ParallelHttpRequestHandler(aiohttp.server.ServerHttpProtocol):
+class ParallelHttpRequestHandler(aiohttp.StreamProtocol):
+    _request_count = 0
+    _request_handler = None
+    _reading_request = False
+    _keep_alive = False  # keep transport open
+    _keep_alive_handle = None  # keep alive timer handle
+    _timeout_handle = None  # slow request timer handle
+
+    _request_prefix = aiohttp.HttpPrefixParser()  # http method parser
+    _request_parser = aiohttp.HttpRequestParser()  # default request parser
+
     def __init__(
             self, manager, *, loop: AbstractEventLoop = None,
             keep_alive=75,
@@ -714,15 +751,16 @@ class ParallelHttpRequestHandler(aiohttp.server.ServerHttpProtocol):
             **kwargs):
         super().__init__(
             loop=loop,
-            keep_alive=keep_alive,
-            keep_alive_on=keep_alive_on,
-            timeout=timeout,
-            logger=server_logger,
-            access_log=access_logger,
-            access_log_format=access_log_format,
-            debug=debug,
-            log=log,
-            **kwargs)
+            disconnect_error=aiohttp.errors.ClientDisconnectedError, **kwargs)
+
+        self._keep_alive_on = keep_alive_on
+        self._keep_alive_period = keep_alive  # number of seconds to keep alive
+        self._timeout = timeout  # slow request timeout
+        self._loop = loop if loop is not None else asyncio.get_event_loop()
+
+        self._server_logger = log or server_logger
+        self._debug = debug
+        self._access_logger = aiohttp.helpers.AccessLogger(access_logger, access_log_format) if access_logger else None
 
         self._manager = manager
         self._loop = loop
@@ -732,21 +770,216 @@ class ParallelHttpRequestHandler(aiohttp.server.ServerHttpProtocol):
         self._buffer_dir = buffer_dir
         self._cached_downloader = cached_downloader
 
-    def connection_made(self, transport):
-        super().connection_made(transport)
-        self._manager.connection_made(self, transport)
-
-    def connection_lost(self, exc):
-        self._manager.connection_lost(self, exc)
-        super().connection_lost(exc)
-
-    def closing(self, timeout=15.0):
-        super().closing(timeout)
-
     def check_request(self, message: RawRequestMessage):
         if message.method == hdrs.METH_CONNECT:
             self.handle_error(status=405, message=message)
             raise UnsupportedError("Method '%s' is not supported." % message.method)
+
+    @property
+    def keep_alive_timeout(self):
+        return self._keep_alive_period
+
+    def closing(self, timeout=15.0):
+        """Worker process is about to exit, we need cleanup everything and
+        stop accepting requests. It is especially important for keep-alive
+        connections."""
+        self._keep_alive = False
+        self._keep_alive_on = False
+        self._keep_alive_period = None
+
+        if not self._reading_request and self.transport is not None:
+            if self._request_handler:
+                self._request_handler.cancel()
+                self._request_handler = None
+
+            self.transport.close()
+            self.transport = None
+        elif self.transport is not None and timeout:
+            if self._timeout_handle is not None:
+                self._timeout_handle.cancel()
+
+            # use slow request timeout for closing
+            # connection_lost cleans timeout handler
+            now = self._loop.time()
+            self._timeout_handle = self._loop.call_at(
+                ceil(now + timeout), self.cancel_slow_request)
+
+    def connection_made(self, transport):
+        super().connection_made(transport)
+
+        self._request_handler = ensure_future(self.start(), loop=self._loop)
+
+        # start slow request timer
+        if self._timeout:
+            now = self._loop.time()
+            self._timeout_handle = self._loop.call_at(
+                ceil(now + self._timeout), self.cancel_slow_request)
+
+        if self._keep_alive_on:
+            tcp_keepalive(self, transport)
+
+        self._manager.connection_made(self, transport)
+
+    def connection_lost(self, exc):
+        self._manager.connection_lost(self, exc)
+
+        super().connection_lost(exc)
+
+        if self._request_handler is not None:
+            self._request_handler.cancel()
+            self._request_handler = None
+        if self._keep_alive_handle is not None:
+            self._keep_alive_handle.cancel()
+            self._keep_alive_handle = None
+        if self._timeout_handle is not None:
+            self._timeout_handle.cancel()
+            self._timeout_handle = None
+
+    def data_received(self, data):
+        super().data_received(data)
+
+        # reading request
+        if not self._reading_request:
+            self._reading_request = True
+
+        # stop keep-alive timer
+        if self._keep_alive_handle is not None:
+            self._keep_alive_handle.cancel()
+            self._keep_alive_handle = None
+
+    def keep_alive(self, val):
+        """Set keep-alive connection mode.
+
+        :param bool val: new state.
+        """
+        self._keep_alive = val
+
+    def log_access(self, message, environ, response, time):
+        if self._access_logger:
+            self._access_logger.log(message, environ, response, self.transport, time)
+
+    def log_debug(self, *args, **kw):
+        if self._debug:
+            self._server_logger.debug(*args, **kw)
+
+    def log_exception(self, *args, **kw):
+        self._server_logger.exception(*args, **kw)
+
+    def cancel_slow_request(self):
+        if self._request_handler is not None:
+            self._request_handler.cancel()
+            self._request_handler = None
+
+        if self.transport is not None:
+            self.transport.close()
+
+        self.log_debug('Close slow request.')
+
+    @asyncio.coroutine
+    def start(self):
+        """Start processing of incoming requests.
+
+        It reads request line, request headers and request payload, then
+        calls handle_request() method. Subclass has to override
+        handle_request(). start() handles various exceptions in request
+        or response handling. Connection is being closed always unless
+        keep_alive(True) specified.
+        """
+        reader = self.reader
+
+        while True:
+            message = None
+            self._keep_alive = False
+            self._request_count += 1
+            self._reading_request = False
+
+            payload = None
+            try:
+                # read http request method
+                prefix = reader.set_parser(self._request_prefix)
+                yield from prefix.read()
+
+                # start reading request
+                self._reading_request = True
+
+                # start slow request timer
+                if self._timeout and self._timeout_handle is None:
+                    now = self._loop.time()
+                    self._timeout_handle = self._loop.call_at(
+                        ceil(now + self._timeout), self.cancel_slow_request)
+
+                # read request headers
+                httpstream = reader.set_parser(self._request_parser)
+                message = yield from httpstream.read()
+
+                # cancel slow request timer
+                if self._timeout_handle is not None:
+                    self._timeout_handle.cancel()
+                    self._timeout_handle = None
+
+                # request may not have payload
+                if (message.headers.get(hdrs.CONTENT_LENGTH, 0) or
+                            hdrs.SEC_WEBSOCKET_KEY1 in message.headers or
+                            'chunked' in message.headers.get(
+                            hdrs.TRANSFER_ENCODING, '')):
+                    payload = aiohttp.streams.FlowControlStreamReader(
+                        reader, loop=self._loop)
+                    reader.set_parser(
+                        aiohttp.HttpPayloadParser(message), payload)
+                else:
+                    payload = EMPTY_PAYLOAD
+
+                yield from self.handle_request(message, payload)
+
+            except asyncio.CancelledError:
+                return
+            except aiohttp.errors.ClientDisconnectedError:
+                self.log_debug(
+                    'Ignored premature client disconnection #1.')
+                return
+            except aiohttp.errors.HttpProcessingError as exc:
+                if self.transport is not None:
+                    yield from self.handle_error(exc.code, message,
+                                                 None, exc, exc.headers,
+                                                 exc.message)
+            except aiohttp.errors.LineLimitExceededParserError as exc:
+                yield from self.handle_error(400, message, None, exc)
+            except Exception as exc:
+                yield from self.handle_error(500, message, None, exc)
+            finally:
+                if self.transport is None:
+                    self.log_debug(
+                        'Ignored premature client disconnection #2.')
+                    return
+
+                if payload and not payload.is_eof():
+                    self.log_debug('Uncompleted request.')
+                    self._request_handler = None
+                    self.transport.close()
+                    return
+                else:
+                    reader.unset_parser()
+
+                if self._request_handler:
+                    if self._keep_alive and self._keep_alive_period:
+                        self.log_debug(
+                            'Start keep-alive timer for %s sec.',
+                            self._keep_alive_period)
+                        now = self._loop.time()
+                        self._keep_alive_handle = self._loop.call_at(
+                            ceil(now + self._keep_alive_period),
+                            self.transport.close)
+                    elif self._keep_alive and self._keep_alive_on:
+                        # do nothing, rely on kernel or upstream server
+                        pass
+                    else:
+                        self.log_debug('Close client connection.')
+                        self._request_handler = None
+                        self.transport.close()
+                        return
+                else:
+                    # connection is closed
+                    return
 
     async def handle_request(self, message: RawRequestMessage, payload):
         now = self._loop.time()
@@ -754,16 +987,23 @@ class ParallelHttpRequestHandler(aiohttp.server.ServerHttpProtocol):
         self.check_request(message)
         self.keep_alive(True)
 
-        # Try to process parallel.
-        response = await self.process_parallel(message, payload)
+        if message.method == hdrs.METH_CONNECT:
+            response = await self.process_connect(message, payload)
+        else:
+            # Try to process parallel.
+            response = await self.process_parallel(message, payload)
 
-        # Otherwise process normally.
-        if not response:
-            response = await self.process_normally(message, payload)
+            # Otherwise process normally.
+            if not response:
+                response = await self.process_normally(message, payload)
 
         self.log_access(message, None, response, self._loop.time() - now)
 
-    async def process_normally(self, message: RawRequestMessage, payload):
+    async def process_connect(self, message: RawRequestMessage, payload) -> aiohttp.Response:
+        # TODO: implement.
+        pass
+
+    async def process_normally(self, message: RawRequestMessage, payload) -> aiohttp.Response:
         """Process request normally."""
         req_data = payload if not isinstance(payload, EmptyStreamReader) else None
 
@@ -838,12 +1078,64 @@ class ParallelHttpRequestHandler(aiohttp.server.ServerHttpProtocol):
 
         try:
             await self._cached_downloader.download(message.path, head, lambda chunk: client_res.write(chunk))
-            await client_res.write_eof()
+            client_res.write_eof()
         except Exception as exc:
             self.log_debug("CANCELLED PARALLEL GET {!r}. Caused by exception: {!r}.".format(message.path, exc))
             raise
 
         return client_res
+
+    def handle_error(self, status=500, message=None, payload=None, exc=None, headers=None, reason=None):
+        """Handle errors.
+
+        Returns http response with specific status code. Logs additional
+        information. It always closes current connection."""
+        now = self._loop.time()
+        try:
+            if self._request_handler is None:
+                # client has been disconnected during writing.
+                return ()
+
+            if status == 500:
+                self.log_exception("Error handling request")
+
+            try:
+                if reason is None or reason == '':
+                    reason, msg = RESPONSES[status]
+                else:
+                    msg = reason
+            except KeyError:
+                status = 500
+                reason, msg = '???', ''
+
+            if self._debug and exc is not None:
+                try:
+                    tb = traceback.format_exc()
+                    tb = html_escape(tb)
+                    msg += '<br><h2>Traceback:</h2>\n<pre>{}</pre>'.format(tb)
+                except:
+                    pass
+
+            html = DEFAULT_ERROR_MESSAGE.format(
+                status=status, reason=reason, message=msg).encode('utf-8')
+
+            response = aiohttp.Response(self.writer, status, close=True)
+            response.add_header(hdrs.CONTENT_TYPE, 'text/html; charset=utf-8')
+            response.add_header(hdrs.CONTENT_LENGTH, str(len(html)))
+            if headers is not None:
+                for name, value in headers:
+                    response.add_header(name, value)
+            response.send_headers()
+
+            response.write(html)
+            # disable CORK, enable NODELAY if needed
+            self.writer.set_tcp_nodelay(True)
+            drain = response.write_eof()
+
+            self.log_access(message, None, response, self._loop.time() - now)
+            return drain
+        finally:
+            self.keep_alive(False)
 
     async def get_file_head(self, url: str) -> Optional[CIMultiDictProxy]:
         """Make a HEAD request to get a 'content-length' and 'accept-ranges' headers."""
