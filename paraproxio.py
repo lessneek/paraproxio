@@ -35,7 +35,6 @@ import os
 import shutil
 import argparse
 import concurrent.futures
-from collections import namedtuple
 import json
 from time import time
 import threading
