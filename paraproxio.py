@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 """
 Paraproxio is an HTTP proxy with a parallel downloading of big files.
 """
@@ -424,8 +424,6 @@ class ParallelDownloader:
     def __repr__(self, *args, **kwargs):
         return '<ParallelDownloader: {!r}>'.format(self._url)
 
-
-CacheFileInfo = namedtuple('CacheFileInfo', ['url', 'length', 'last_modified', 'etag'])
 
 INITIALIZING = 'INITIALIZING'
 READY = 'READY'
