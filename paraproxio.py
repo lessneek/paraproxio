@@ -52,7 +52,7 @@ try:
     import aiohttp
     import aiohttp.hdrs as hdrs
     import aiohttp.server
-    from aiohttp.multidict import CIMultiDictProxy
+    from multidict import CIMultiDictProxy
     from aiohttp.protocol import RawRequestMessage
     from aiohttp.streams import EmptyStreamReader
 except ImportError as err:
