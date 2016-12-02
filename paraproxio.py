@@ -722,6 +722,19 @@ class CachingDownloader:
         return '<CachingDownloader (D:{!s} U:{!s})>'.format(len(self._downloadings), len(self._uploadings))
 
 
+class TunnelClientProtocol(aiohttp.StreamProtocol):
+    def __init__(self, client_stream: aiohttp.StreamProtocol, loop, **kwargs):
+        super().__init__(loop=loop, **kwargs)
+        self._client_stream = client_stream
+        self._loop = loop
+
+    def connection_made(self, transport):
+        super().connection_made(transport)
+
+    async def _start_client_stream(self):
+        await self._client_stream.reader
+
+
 class ParallelHttpRequestHandler(aiohttp.StreamProtocol):
     _request_count = 0
     _request_handler = None
@@ -729,8 +742,9 @@ class ParallelHttpRequestHandler(aiohttp.StreamProtocol):
     _keep_alive = False  # keep transport open
     _keep_alive_handle = None  # keep alive timer handle
     _timeout_handle = None  # slow request timer handle
+    _tunnel_connection = None
 
-    _request_prefix = aiohttp.HttpPrefixParser()  # http method parser
+    _prefix_parser = aiohttp.HttpPrefixParser()  # http method parser
     _request_parser = aiohttp.HttpRequestParser()  # default request parser
 
     def __init__(
@@ -770,10 +784,9 @@ class ParallelHttpRequestHandler(aiohttp.StreamProtocol):
         self._buffer_dir = buffer_dir
         self._cached_downloader = cached_downloader
 
-    def check_request(self, message: RawRequestMessage):
-        if message.method == hdrs.METH_CONNECT:
-            self.handle_error(status=405, message=message)
-            raise UnsupportedError("Method '%s' is not supported." % message.method)
+    def keep_alive(self, val: bool):
+        """Set keep-alive connection mode."""
+        self._keep_alive = val
 
     @property
     def keep_alive_timeout(self):
@@ -847,13 +860,6 @@ class ParallelHttpRequestHandler(aiohttp.StreamProtocol):
             self._keep_alive_handle.cancel()
             self._keep_alive_handle = None
 
-    def keep_alive(self, val):
-        """Set keep-alive connection mode.
-
-        :param bool val: new state.
-        """
-        self._keep_alive = val
-
     def log_access(self, message, environ, response, time):
         if self._access_logger:
             self._access_logger.log(message, environ, response, self.transport, time)
@@ -875,8 +881,7 @@ class ParallelHttpRequestHandler(aiohttp.StreamProtocol):
 
         self.log_debug('Close slow request.')
 
-    @asyncio.coroutine
-    def start(self):
+    async def start(self):
         """Start processing of incoming requests.
 
         It reads request line, request headers and request payload, then
@@ -888,6 +893,9 @@ class ParallelHttpRequestHandler(aiohttp.StreamProtocol):
         reader = self.reader
 
         while True:
+            if self._tunnel_connection:
+                return
+
             message = None
             self._keep_alive = False
             self._request_count += 1
@@ -896,8 +904,8 @@ class ParallelHttpRequestHandler(aiohttp.StreamProtocol):
             payload = None
             try:
                 # read http request method
-                prefix = reader.set_parser(self._request_prefix)
-                yield from prefix.read()
+                prefix = reader.set_parser(self._prefix_parser)
+                await prefix.read()
 
                 # start reading request
                 self._reading_request = True
@@ -910,7 +918,7 @@ class ParallelHttpRequestHandler(aiohttp.StreamProtocol):
 
                 # read request headers
                 httpstream = reader.set_parser(self._request_parser)
-                message = yield from httpstream.read()
+                message = await httpstream.read()
 
                 # cancel slow request timer
                 if self._timeout_handle is not None:
@@ -929,7 +937,7 @@ class ParallelHttpRequestHandler(aiohttp.StreamProtocol):
                 else:
                     payload = EMPTY_PAYLOAD
 
-                yield from self.handle_request(message, payload)
+                await self.handle_request(message, payload)
 
             except asyncio.CancelledError:
                 return
@@ -939,13 +947,13 @@ class ParallelHttpRequestHandler(aiohttp.StreamProtocol):
                 return
             except aiohttp.errors.HttpProcessingError as exc:
                 if self.transport is not None:
-                    yield from self.handle_error(exc.code, message,
-                                                 None, exc, exc.headers,
-                                                 exc.message)
+                    await self.handle_error(exc.code, message,
+                                            None, exc, exc.headers,
+                                            exc.message)
             except aiohttp.errors.LineLimitExceededParserError as exc:
-                yield from self.handle_error(400, message, None, exc)
+                await self.handle_error(400, message, None, exc)
             except Exception as exc:
-                yield from self.handle_error(500, message, None, exc)
+                await self.handle_error(500, message, None, exc)
             finally:
                 if self.transport is None:
                     self.log_debug(
@@ -984,14 +992,13 @@ class ParallelHttpRequestHandler(aiohttp.StreamProtocol):
     async def handle_request(self, message: RawRequestMessage, payload):
         now = self._loop.time()
 
-        self.check_request(message)
         self.keep_alive(True)
 
         if message.method == hdrs.METH_CONNECT:
-            response = await self.process_connect(message, payload)
+            response = await self.process_connect(message)
         else:
             # Try to process parallel.
-            response = await self.process_parallel(message, payload)
+            response = await self.process_parallel(message)
 
             # Otherwise process normally.
             if not response:
@@ -999,9 +1006,23 @@ class ParallelHttpRequestHandler(aiohttp.StreamProtocol):
 
         self.log_access(message, None, response, self._loop.time() - now)
 
-    async def process_connect(self, message: RawRequestMessage, payload) -> aiohttp.Response:
-        # TODO: implement.
-        pass
+    async def process_connect(self, message: RawRequestMessage) -> aiohttp.Response:
+        host, port = message.path.split(':')
+        if port:
+            try:
+                port = int(port)
+            except ValueError:
+                self.handle_error()
+                return None
+        else:
+            port = 80
+
+        self._tunnel_connection = await self._loop.create_connection(
+            lambda: TunnelClientProtocol(self, self._loop), host, port)
+
+        client_res = aiohttp.Response(self.writer, 200, http_version=message.version)
+        client_res.send_headers()
+        return client_res
 
     async def process_normally(self, message: RawRequestMessage, payload) -> aiohttp.Response:
         """Process request normally."""
@@ -1044,7 +1065,7 @@ class ParallelHttpRequestHandler(aiohttp.StreamProtocol):
             self.log_debug("CANCELLED {!s} {!r}.".format(message.method, message.path))
             raise
 
-    async def process_parallel(self, message: RawRequestMessage, payload) -> aiohttp.Response:
+    async def process_parallel(self, message: RawRequestMessage) -> aiohttp.Response:
         """Try process a request parallel. Returns True in case of processed parallel, otherwise False."""
         # Checking the opportunity of parallel downloading.
         if message.method != hdrs.METH_GET or not need_file_to_parallel(message.path):
