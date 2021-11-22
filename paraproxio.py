@@ -2,7 +2,7 @@
 """
 Paraproxio is an HTTP proxy with a parallel downloading of big files.
 """
-# Copyright (C) 2016 Alexander Logger <intagger@gmail.com>
+# Copyright (C) 2016 Alexander Logger
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by

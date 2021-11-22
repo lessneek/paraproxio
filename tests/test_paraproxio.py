@@ -1,6 +1,6 @@
 #!/usr/bin/python
 #
-# Copyright (C) 2016 Alexander Logger <intagger@gmail.com>
+# Copyright (C) 2016 Alexander Logger
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
